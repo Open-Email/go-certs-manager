@@ -1,3 +1,6 @@
+// Provenance: originally smtp-in pkg/storage, hardened in openemail/filter
+// (IfMatch CAS, os.ErrNotExist 404 contract, contract test) and upstreamed here.
+
 package storage
 
 import (

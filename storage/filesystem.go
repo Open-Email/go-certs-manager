@@ -1,3 +1,6 @@
+// Provenance: originally smtp-in pkg/storage, hardened in openemail/filter
+// (IfMatch CAS, os.ErrNotExist 404 contract, contract test) and upstreamed here.
+
 package storage
 
 import (
@@ -10,12 +13,20 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"log/slog"
 )
 
 var errPathTraversal = errors.New("invalid storage key: path traversal detected")
+
+// fsCondPutMu serializes IfMatch conditional puts process-wide. The ETag
+// compare and the rename must be one atomic step or two racing CAS writers
+// (same captured ETag) could both pass the compare; a single process-wide
+// mutex is sufficient because the filesystem backend is only ever contended
+// within one process (local mode, tests).
+var fsCondPutMu sync.Mutex
 
 // FilesystemBackend implements the Backend interface using local filesystem
 type FilesystemBackend struct {
@@ -98,6 +109,16 @@ func (f *FilesystemBackend) PutObject(ctx context.Context, key string, reader io
 		return fmt.Errorf("failed to write data: %w", err)
 	}
 
+	// Flush the contents to disk BEFORE publishing the name: without this a
+	// crash can leave the linked/renamed object pointing at unwritten (zero
+	// or partial) data even though PutObject returned success — losing an
+	// acknowledged learn sample, or truncating a model blob or the CURRENT
+	// pointer (which would wedge every poller and the trainer's warm start).
+	if err := tmpFile.Sync(); err != nil {
+		tmpFile.Close()
+		return fmt.Errorf("failed to fsync temp file: %w", err)
+	}
+
 	if err := tmpFile.Close(); err != nil {
 		return fmt.Errorf("failed to close temp file: %w", err)
 	}
@@ -114,15 +135,71 @@ func (f *FilesystemBackend) PutObject(ctx context.Context, key string, reader io
 			}
 			return fmt.Errorf("failed to link file: %w", err)
 		}
+	} else if opts.IfMatch != "" {
+		// Conditional put (IfMatch: replace only if the object still carries
+		// this ETag — the CAS the trainer uses on the CURRENT pointer). The
+		// compare and the rename happen under one process-wide mutex so two
+		// racing writers holding the same captured ETag cannot both win: the
+		// first rename changes the file's mtime (and therefore its ETag), so
+		// the second compare fails.
+		if err := f.putIfMatch(key, fullPath, tmpPath, opts.IfMatch); err != nil {
+			return err
+		}
 	} else if err := os.Rename(tmpPath, fullPath); err != nil {
 		// Atomic rename to final destination (overwrite semantics).
 		return fmt.Errorf("failed to rename file: %w", err)
+	}
+
+	// Fsync the parent directory so the new/renamed directory entry itself
+	// survives a crash — the data sync above does not make the name durable.
+	// Best-effort: the object is already visible, so a dir-sync failure is
+	// logged, not surfaced as a write failure.
+	if err := syncDir(dir); err != nil {
+		f.logger.Warn("failed to fsync directory after publish", "dir", dir, "error", err)
 	}
 
 	f.logger.Debug("Stored object to filesystem",
 		"key", key,
 		"size", written)
 
+	return nil
+}
+
+// syncDir fsyncs a directory so a create/rename/link within it is durable
+// across a crash.
+func syncDir(dir string) error {
+	d, err := os.Open(dir)
+	if err != nil {
+		return err
+	}
+	defer d.Close()
+	return d.Sync()
+}
+
+// putIfMatch atomically publishes tmpPath to fullPath only if the current
+// object's ETag equals ifMatch (computed exactly as StatObject computes it).
+// A missing object or a different ETag yields *ConditionalPutError.
+func (f *FilesystemBackend) putIfMatch(key, fullPath, tmpPath, ifMatch string) error {
+	fsCondPutMu.Lock()
+	defer fsCondPutMu.Unlock()
+
+	info, err := os.Stat(fullPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			// IfMatch requires the object to exist: matching against a
+			// deleted object is a failed precondition, same as S3.
+			f.logger.Debug("Conditional put failed - file does not exist", "key", key)
+			return &ConditionalPutError{Key: key}
+		}
+		return fmt.Errorf("failed to stat file for conditional put: %w", err)
+	}
+	if generateETag(key, info.ModTime()) != ifMatch {
+		f.logger.Debug("Conditional put failed - etag mismatch", "key", key)
+		return &ConditionalPutError{Key: key}
+	}
+	if err := os.Rename(tmpPath, fullPath); err != nil {
+		return fmt.Errorf("failed to rename file: %w", err)
+	}
 	return nil
 }
 
@@ -178,6 +255,14 @@ func (f *FilesystemBackend) RemoveObject(ctx context.Context, key string) error 
 	if !ok {
 		return errPathTraversal
 	}
+
+	// A delete must not interleave with putIfMatch's stat-compare-rename
+	// critical section: without the lock, a concurrent IfMatch put could
+	// pass its ETag compare, have this delete run, then rename its temp
+	// file into place — resurrecting a key (e.g. the CURRENT pointer) that
+	// a reset just removed, and dangling once the reset deletes the blob.
+	fsCondPutMu.Lock()
+	defer fsCondPutMu.Unlock()
 
 	err := os.Remove(fullPath)
 	if err != nil {
