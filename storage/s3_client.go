@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"strings"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -55,10 +56,19 @@ func NewS3Client(ctx context.Context, opts S3ClientOptions, logger *slog.Logger)
 	}
 
 	if opts.Endpoint != "" {
-		logger.Info("s3: using custom S3 endpoint", "endpoint", opts.Endpoint)
+		endpoint := opts.Endpoint
+		if !strings.Contains(endpoint, "://") {
+			endpoint = "https://" + endpoint
+		}
+		logger.Info("s3: using custom S3 endpoint", "endpoint", endpoint)
 		return s3.NewFromConfig(awsCfg, func(o *s3.Options) {
-			o.BaseEndpoint = aws.String(opts.Endpoint)
+			o.BaseEndpoint = aws.String(endpoint)
 			o.UsePathStyle = opts.PathStyle
+			// aws-sdk-go-v2 defaults to WhenSupported, which attaches checksum
+			// headers that S3-compatible providers such as Cloudflare R2 and
+			// Backblaze B2 reject with 400.
+			o.RequestChecksumCalculation = aws.RequestChecksumCalculationWhenRequired
+			o.ResponseChecksumValidation = aws.ResponseChecksumValidationWhenRequired
 		}), nil
 	}
 	return s3.NewFromConfig(awsCfg), nil
