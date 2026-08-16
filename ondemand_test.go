@@ -159,6 +159,10 @@ func TestOnDemand_CertIndexDiff(t *testing.T) {
 	if len(changed) != 2 {
 		t.Fatalf("a follower with no state must refresh everything, got %v", changed)
 	}
+	// Adoption is the CALLER's, after each refresh actually succeeded.
+	for _, h := range changed {
+		follower.noteRefreshed(ctx, h)
+	}
 	// Second pass: nothing changed, so nothing is re-read. This is the whole
 	// point — steady-state cost independent of the hostname count.
 	if changed := follower.changedSince(ctx, hosts); len(changed) != 0 {
@@ -170,6 +174,7 @@ func TestOnDemand_CertIndexDiff(t *testing.T) {
 	if len(changed) != 1 || changed[0] != "b.acme.com" {
 		t.Fatalf("expected only b.acme.com, got %v", changed)
 	}
+	follower.noteRefreshed(ctx, "b.acme.com")
 
 	// The published index must always be the FULL inventory: a partial one would
 	// read to a follower as "every other hostname changed".
@@ -296,4 +301,110 @@ func TestOnDemand_StaticDomainsUnaffected(t *testing.T) {
 		t.Fatalf("static domains must not use HandshakeWait, took %s", elapsed)
 	}
 	_ = fmt.Sprint(err)
+}
+
+// A hostname's release must reach the followers. The empty set and the
+// never-published state have the same string, so without an explicit
+// "have we written yet" flag the emptying is skipped and every follower keeps
+// serving TLS for retired hostnames from a stale object.
+func TestOnDemand_PublishesAnEmptySet(t *testing.T) {
+	backend, err := storage.NewFilesystemBackend(t.TempDir(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	hosts := []string{"a.acme.com"}
+	leader := newOnDemand(OnDemandConfig{
+		Enumerate: func(context.Context) ([]string, error) { return hosts, nil },
+	}, backend, "")
+	follower := newOnDemand(OnDemandConfig{}, backend, "")
+	ctx := context.Background()
+
+	leader.refreshLeader(ctx, slog.Default())
+	if err := follower.refreshFollower(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if !follower.allows("a.acme.com") {
+		t.Fatal("follower should have the hostname")
+	}
+
+	hosts = nil
+	leader.refreshLeader(ctx, slog.Default())
+	if err := follower.refreshFollower(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if follower.allows("a.acme.com") {
+		t.Fatal("a released hostname must stop being allowed on the follower")
+	}
+}
+
+// A failed refresh must be retried, not remembered as done: nothing else heals
+// it — the handshake path serves whatever is already in memory, stale or not.
+func TestOnDemand_FailedRefreshIsRetried(t *testing.T) {
+	backend, err := storage.NewFilesystemBackend(t.TempDir(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	leader := newOnDemand(OnDemandConfig{}, backend, "")
+	follower := newOnDemand(OnDemandConfig{}, backend, "")
+	ctx := context.Background()
+	leader.noteIssued(ctx, "a.acme.com", time.Now().Add(60*24*time.Hour))
+
+	hosts := []string{"a.acme.com"}
+	if got := follower.changedSince(ctx, hosts); len(got) != 1 {
+		t.Fatalf("expected the hostname to need a refresh, got %v", got)
+	}
+	// The refresh "failed" — nothing adopted — so it is offered again.
+	if got := follower.changedSince(ctx, hosts); len(got) != 1 {
+		t.Fatalf("a failed refresh must be retried, got %v", got)
+	}
+	follower.noteRefreshed(ctx, "a.acme.com")
+	if got := follower.changedSince(ctx, hosts); len(got) != 0 {
+		t.Fatalf("a succeeded refresh must not repeat, got %v", got)
+	}
+}
+
+// The allow-set is keyed by values customers choose, so bookkeeping for
+// hostnames that leave it has to be forgotten or a long-running node grows an
+// entry for every hostname ever claimed.
+func TestOnDemand_ForgetsDepartedHostnames(t *testing.T) {
+	backend, err := storage.NewFilesystemBackend(t.TempDir(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	od := newOnDemand(OnDemandConfig{ExpectedTarget: "mail.open.email"}, backend, "")
+	od.resolveFn = func(context.Context, string, string) string { return "resolves elsewhere" }
+	od.store([]string{"gone.acme.com"})
+	if ok, _ := od.preflightOK(context.Background(), "gone.acme.com"); ok {
+		t.Fatal("expected the pre-flight to fail")
+	}
+	od.mu.Lock()
+	_, backing := od.preflight["gone.acme.com"]
+	od.mu.Unlock()
+	if !backing {
+		t.Fatal("expected a backoff entry")
+	}
+
+	od.store(nil)
+	od.mu.Lock()
+	_, still := od.preflight["gone.acme.com"]
+	od.mu.Unlock()
+	if still {
+		t.Fatal("a departed hostname's backoff entry should be forgotten")
+	}
+}
+
+// A transient resolver failure on the customer's side is "we cannot tell", not
+// "they unpointed it": failing closed there locked a demonstrably-working
+// hostname out of issuance for a whole backoff window over one SERVFAIL.
+func TestOnDemand_PreflightFailsOpenOnResolverError(t *testing.T) {
+	backend, err := storage.NewFilesystemBackend(t.TempDir(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	od := newOnDemand(OnDemandConfig{ExpectedTarget: "mail.open.email"}, backend, "")
+	// resolvesTo's own contract: "" means "points at us (or we cannot tell)".
+	od.resolveFn = func(context.Context, string, string) string { return "" }
+	if ok, reason := od.preflightOK(context.Background(), "mail.acme.com"); !ok {
+		t.Fatalf("expected the pre-flight to pass, got %q", reason)
+	}
 }

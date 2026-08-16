@@ -188,6 +188,12 @@ that against their retry budgets), issuance runs **bounded-concurrent**
 `ondemand/certs-index.json` says **changed** — O(1) storage reads per tick
 rather than one per hostname.
 
+The handshake path enforces the SAME pre-flight and order budget as the
+maintenance loop. That is not defensive duplication: a handshake is triggered by
+anyone who can open a TCP connection and send an SNI, so without it a bulk
+onboarding drives one CA order per hostname within minutes and takes existing
+customers' renewals down with the account limit.
+
 `HandshakeWait` is the one deliberate exception to "never block a handshake".
 The client behind a vanity hostname is typically a person's mail app connecting
 to a name they configured seconds ago, where a failed connection is a support

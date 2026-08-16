@@ -96,7 +96,12 @@ func (m *Manager) maintainOnDemand(leader bool) {
 		for _, host := range m.onDemand.changedSince(ctx, hosts) {
 			if _, err := m.certCache.Refresh(ctx, host); err != nil {
 				m.logger.Debug("TLS: on-demand follower refresh found nothing yet", "domain", host, "error", err)
+				continue
 			}
+			// Adopt only on success, so a failed read is retried next tick rather
+			// than remembered as done (the handshake path cannot heal it: it
+			// serves whatever is already in memory).
+			m.onDemand.noteRefreshed(ctx, host)
 		}
 		return
 	}

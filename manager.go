@@ -383,7 +383,7 @@ func (m *Manager) getCertificate(domain string, onDemandHost bool) (*tls.Certifi
 				return cert, nil
 			}
 		}
-		m.requestIssue(domain) // async, deduplicated
+		m.requestIssue(domain, onDemandHost) // async, deduplicated
 		if wait > 0 {
 			if cert, ok := m.awaitCertificate(domain, wait); ok {
 				return cert, nil
@@ -392,33 +392,38 @@ func (m *Manager) getCertificate(domain string, onDemandHost bool) (*tls.Certifi
 		return nil, fmt.Errorf("%w: issuance in progress for %s", ErrCertificateUnavailable, domain)
 	}
 
-	// Follower: dedup concurrent handshakes and throttle storage reads.
-	unlock := m.inflight.lock(domain)
-	defer unlock()
-	if cert, ok := m.certCache.Get(domain); ok { // populated while we waited
+	// Follower: dedup concurrent handshakes and throttle storage reads. The lock
+	// is held only across the STORAGE READ, never across the wait below — ten
+	// connections to one not-yet-issued hostname would otherwise queue on it and
+	// the tenth would wait ten times the bound, long past any client's patience,
+	// each holding a goroutine and a connection the whole time.
+	cert, err := func() (*tls.Certificate, error) {
+		unlock := m.inflight.lock(domain)
+		defer unlock()
+		if cert, ok := m.certCache.Get(domain); ok { // populated while we waited
+			return cert, nil
+		}
+		if m.certCache.recentMiss(domain) {
+			return nil, fmt.Errorf("%w: %s not yet issued by leader", ErrCertificateUnavailable, domain)
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		cert, err := m.certCache.Refresh(ctx, domain)
+		if err != nil {
+			m.certCache.noteMiss(domain)
+			return nil, fmt.Errorf("%w: %s not yet available (follower): %v", ErrCertificateUnavailable, domain, err)
+		}
+		return cert, nil
+	}()
+	if err == nil {
 		return cert, nil
 	}
-	if m.certCache.recentMiss(domain) {
-		if wait > 0 {
-			if cert, ok := m.awaitCertificate(domain, wait); ok {
-				return cert, nil
-			}
+	if wait > 0 {
+		if cert, ok := m.awaitCertificate(domain, wait); ok {
+			return cert, nil
 		}
-		return nil, fmt.Errorf("%w: %s not yet issued by leader", ErrCertificateUnavailable, domain)
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	cert, err := m.certCache.Refresh(ctx, domain)
-	if err != nil {
-		m.certCache.noteMiss(domain)
-		if wait > 0 {
-			if cert, ok := m.awaitCertificate(domain, wait); ok {
-				return cert, nil
-			}
-		}
-		return nil, fmt.Errorf("%w: %s not yet available (follower): %v", ErrCertificateUnavailable, domain, err)
-	}
-	return cert, nil
+	return nil, err
 }
 
 // awaitCertificate polls for a certificate appearing for `domain` within
@@ -440,7 +445,13 @@ func (m *Manager) awaitCertificate(domain string, limit time.Duration) (*tls.Cer
 		if remaining < sleep {
 			sleep = remaining
 		}
-		time.Sleep(sleep)
+		// select, not a bare Sleep: a shutdown must not wait out every pinned
+		// handshake, and Stop() has its own 10s patience.
+		select {
+		case <-time.After(sleep):
+		case <-m.stopCh:
+			return nil, false
+		}
 		if cert, ok := m.certCache.Get(domain); ok {
 			return cert, true
 		}
@@ -458,7 +469,16 @@ func (m *Manager) awaitCertificate(domain string, limit time.Duration) (*tls.Cer
 
 // requestIssue triggers asynchronous issuance for a domain on the leader,
 // deduplicated so repeated handshakes don't spawn duplicate issuance goroutines.
-func (m *Manager) requestIssue(domain string) {
+//
+// For an ON-DEMAND hostname it enforces the SAME two guards the maintenance
+// loop does, and that is not defensive duplication — it is the difference
+// between a budget and a suggestion. A handshake is triggered by ANYONE who can
+// open a TCP connection and send an SNI, so without them a bulk onboarding (or
+// a client that simply connects early) drives one CA order per hostname within
+// minutes, exhausts the account-wide new-order limit, and takes RENEWALS for
+// existing customers down with it — the exact outcome MaxNewOrdersPerHour
+// exists to prevent.
+func (m *Manager) requestIssue(domain string, onDemandHost bool) {
 	domain = strings.ToLower(domain)
 	if _, inFlight := m.issuing.LoadOrStore(domain, struct{}{}); inFlight {
 		return
@@ -467,6 +487,16 @@ func (m *Manager) requestIssue(domain string) {
 		defer m.issuing.Delete(domain)
 		ctx, cancel := context.WithTimeout(context.Background(), issueTimeout)
 		defer cancel()
+		if onDemandHost && m.onDemand != nil {
+			if ok, reason := m.onDemand.preflightOK(ctx, domain); !ok {
+				m.logger.Debug("TLS: handshake issuance skipped — DNS pre-flight", "domain", domain, "reason", reason)
+				return
+			}
+			if !m.onDemand.orders.take() {
+				m.logger.Info("TLS: handshake issuance deferred — new-order budget exhausted", "domain", domain)
+				return
+			}
+		}
 		if _, err := m.obtain(ctx, domain); err != nil {
 			m.logger.Warn("TLS: background issuance failed", "domain", domain, "error", err)
 		}

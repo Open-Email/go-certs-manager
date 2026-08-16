@@ -126,14 +126,19 @@ type onDemand struct {
 
 	orders *tokenBucket
 
+	// indexMu serializes the cert index's read-modify-write-put. Separate from
+	// `mu` because it is held across I/O and `mu` must never be.
+	indexMu sync.Mutex
+
 	// resolveFn is the pre-flight's resolution decision, injectable for tests
 	// (it returns "" when the hostname points at the target, else why not).
 	resolveFn func(ctx context.Context, hostname, target string) string
 
-	mu        sync.Mutex
-	published string               // last set the leader wrote, joined — change detection
-	preflight map[string]time.Time // hostname -> when its pre-flight may be retried
-	index     map[string]int64     // hostname -> leaf NotAfter (unix), follower diffing
+	mu           sync.Mutex
+	published    string               // last set the leader wrote, joined — change detection
+	hasPublished bool                 // false until the first write, so an EMPTY set still lands
+	preflight    map[string]time.Time // hostname -> when its pre-flight may be retried
+	index        map[string]int64     // hostname -> leaf NotAfter (unix), follower diffing
 }
 
 func newOnDemand(cfg OnDemandConfig, backend storage.Backend, prefix string) *onDemand {
@@ -200,6 +205,22 @@ func (o *onDemand) store(hosts []string) {
 		}
 	}
 	o.allow.Store(&set)
+
+	// Forget bookkeeping for hostnames that have left the allow-set. Both maps
+	// are keyed by a value CUSTOMERS choose, so without this a long-running node
+	// accumulates an entry for every hostname ever claimed and released.
+	o.mu.Lock()
+	for h := range o.preflight {
+		if _, ok := set[h]; !ok {
+			delete(o.preflight, h)
+		}
+	}
+	for h := range o.index {
+		if _, ok := set[h]; !ok {
+			delete(o.index, h)
+		}
+	}
+	o.mu.Unlock()
 }
 
 // refreshLeader enumerates from the authority and publishes the result for the
@@ -225,8 +246,13 @@ func (o *onDemand) refreshLeader(ctx context.Context, logger interface{ Warn(str
 
 	joined := strings.Join(normalized, "\n")
 	o.mu.Lock()
-	unchanged := joined == o.published
-	o.published = joined
+	// `hasPublished` exists because the empty set and the never-written state
+	// have the same string. Without it a fleet whose last vanity hostname was
+	// released never publishes the emptying, and a follower (or a leader that
+	// restarts) keeps serving TLS for retired hostnames from a stale object,
+	// indefinitely.
+	unchanged := o.hasPublished && joined == o.published
+	o.published, o.hasPublished = joined, true
 	o.mu.Unlock()
 	if unchanged {
 		return
@@ -259,14 +285,22 @@ func (o *onDemand) refreshFollower(ctx context.Context) error {
 
 // noteIssued records a hostname's expiry in the shared index (leader side).
 func (o *onDemand) noteIssued(ctx context.Context, hostname string, notAfter time.Time) {
+	// The write lock is held across the marshal AND the put, not just the map
+	// update. With MaxConcurrentOrders issuances in flight, two goroutines that
+	// snapshotted independently would race their puts, and the later-landing
+	// (older) snapshot would erase the other's entry — a hostname the followers
+	// would then never refresh, because their diff sees it unchanged at zero.
+	// Issuance is minutes of work; serializing one small object write is free.
+	o.indexMu.Lock()
+	defer o.indexMu.Unlock()
+
 	o.mu.Lock()
 	if o.index == nil {
 		o.index = make(map[string]int64)
 	}
-	// Read-modify-write over the FULL map, never a single entry: a follower
-	// diffing an index that only contained the last write would read every other
-	// hostname as missing and fall back to the per-host storage reads this exists
-	// to avoid.
+	// The FULL map, never a single entry: a follower diffing an index that held
+	// only the last write would read every other hostname as missing and fall
+	// back to the per-host storage reads this exists to avoid.
 	o.index[strings.ToLower(hostname)] = notAfter.Unix()
 	snapshot := make(map[string]int64, len(o.index))
 	for k, v := range o.index {
@@ -339,13 +373,32 @@ func (o *onDemand) changedSince(ctx context.Context, hosts []string) []string {
 			changed = append(changed, h)
 		}
 	}
-	// Adopt the published view only for what we are about to refresh, so a
-	// failed refresh is retried on the next tick rather than being remembered as
-	// done.
-	for _, h := range changed {
-		o.index[h] = published[h]
-	}
+	// Deliberately NOT adopted here. The caller adopts each hostname only after
+	// its refresh actually succeeded (noteRefreshed): a failed storage read that
+	// had already been remembered as done would never be retried, and the
+	// handshake path cannot heal it either — it serves the stale-but-present
+	// certificate from memory until that certificate expires.
 	return changed
+}
+
+// noteRefreshed records that this node now holds what the published index says
+// for `hostname`. Called only after a successful refresh.
+func (o *onDemand) noteRefreshed(ctx context.Context, hostname string) {
+	body, err := readObject(ctx, o.backend, o.key(certIndexKey))
+	if err != nil {
+		return
+	}
+	var published map[string]int64
+	if err := json.Unmarshal(body, &published); err != nil {
+		return
+	}
+	h := strings.ToLower(hostname)
+	o.mu.Lock()
+	if o.index == nil {
+		o.index = make(map[string]int64)
+	}
+	o.index[h] = published[h]
+	o.mu.Unlock()
 }
 
 // preflightOK reports whether hostname currently resolves to ExpectedTarget,
@@ -404,7 +457,13 @@ func (o *onDemand) resolvesTo(ctx context.Context, hostname, target string) stri
 	}
 	theirs, err := o.resolver.LookupHost(lookupCtx, hostname)
 	if err != nil {
-		return fmt.Sprintf("does not resolve (%v)", err)
+		// FAIL OPEN, exactly as a failure on the target side does. A lookup error
+		// is "we cannot tell", not "the customer unpointed it" — and treating it
+		// as the latter locked a demonstrably-working hostname out of issuance
+		// for a full backoff window over one SERVFAIL. The CA validates
+		// independently, so the cost of being wrong in this direction is one
+		// failed order rather than a day of outage.
+		return ""
 	}
 	ourSet := make(map[string]struct{}, len(ours))
 	for _, a := range ours {
