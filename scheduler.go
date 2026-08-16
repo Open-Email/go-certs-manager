@@ -4,10 +4,11 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 
-	"github.com/Open-Email/go-certs-manager/internal/safego"
 	"github.com/Open-Email/go-certs-manager/dane"
+	"github.com/Open-Email/go-certs-manager/internal/safego"
 )
 
 // startMaintenance launches the background loop that keeps certificates current:
@@ -61,6 +62,128 @@ func (m *Manager) maintainOnce() {
 			}
 		}
 	}
+
+	m.maintainOnDemand(leader)
+}
+
+// maintainOnDemand is the same duty for the DYNAMIC allow-set, and it is a
+// separate function because the static list's shape does not survive contact
+// with thousands of hostnames:
+//
+//   - EVERY host gets its OWN context. The static loop runs under one
+//     issueTimeout-sized deadline, which is right for a handful of names and
+//     wrong for many: past the deadline every remaining host fails with
+//     "context deadline exceeded", and each of those failures would be recorded
+//     against its retry budget for a problem that was ours, not theirs.
+//   - Issuance is BOUNDED and CONCURRENT (MaxConcurrentOrders): serialized
+//     orders would let one slow CA response set the pace for the whole set.
+//   - RENEWALS GO FIRST. When the new-order budget is the scarce resource, a
+//     working service staying up beats a new one starting.
+//   - Followers refresh only what the leader's index says CHANGED, instead of
+//     one storage read per hostname per tick.
+func (m *Manager) maintainOnDemand(leader bool) {
+	if m.onDemand == nil {
+		return
+	}
+	hosts := m.onDemand.hosts()
+	if len(hosts) == 0 {
+		return
+	}
+
+	if !leader {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+		defer cancel()
+		for _, host := range m.onDemand.changedSince(ctx, hosts) {
+			if _, err := m.certCache.Refresh(ctx, host); err != nil {
+				m.logger.Debug("TLS: on-demand follower refresh found nothing yet", "domain", host, "error", err)
+			}
+		}
+		return
+	}
+
+	// LOAD BEFORE JUDGING. On-demand hostnames are not in preload() — that only
+	// covers the static list — so after a restart the leader holds nothing in
+	// memory for names whose certificates are sitting in storage. Classifying
+	// from memory alone would call every one of them a first issuance, spend the
+	// hour's new-order budget re-obtaining certificates we already have, and
+	// starve the renewals that actually needed it. The shared index answers most
+	// of it for free; only hostnames it does not cover cost a storage read, and
+	// only until they are in memory.
+	loadCtx, loadCancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	for _, host := range hosts {
+		if _, have := m.certCache.leafNotAfter(host); have {
+			continue
+		}
+		if _, known := m.onDemand.indexNotAfter(host); !known {
+			continue
+		}
+		if _, err := m.certCache.Refresh(loadCtx, host); err != nil {
+			m.logger.Debug("TLS: on-demand certificate in index but not loadable", "domain", host, "error", err)
+		}
+	}
+	loadCancel()
+
+	// Split the work before doing any of it, so ordering is a property of the
+	// plan rather than of which host happened to come first.
+	var renewals, fresh []string
+	for _, host := range hosts {
+		notAfter, have := m.certCache.leafNotAfter(host)
+		switch {
+		case !have:
+			fresh = append(fresh, host)
+		case time.Until(notAfter) <= m.renewBefore:
+			renewals = append(renewals, host)
+		}
+	}
+	if len(renewals) == 0 && len(fresh) == 0 {
+		return
+	}
+
+	sem := make(chan struct{}, m.onDemand.cfg.MaxConcurrentOrders)
+	var wg sync.WaitGroup
+	// safego, not a bare `go`: a panic in one hostname's issuance must not take
+	// down a process serving every other hostname's traffic.
+	run := func(host string, isRenewal bool) {
+		defer wg.Done()
+		defer func() { <-sem }()
+		// Per-host deadline: one hostname's slow CA cannot consume the budget of
+		// the hostnames queued behind it.
+		ctx, cancel := context.WithTimeout(context.Background(), issueTimeout)
+		defer cancel()
+
+		if !isRenewal {
+			// A first issuance for a name that does not point at us yet is the
+			// common case, and the one that costs a failed validation against a
+			// shared account limit. One DNS lookup replaces that with nothing.
+			if ok, reason := m.onDemand.preflightOK(ctx, host); !ok {
+				m.logger.Debug("TLS: on-demand issuance skipped — DNS pre-flight", "domain", host, "reason", reason)
+				return
+			}
+			if !m.onDemand.orders.take() {
+				m.logger.Info("TLS: on-demand new-order budget exhausted for this hour — deferring", "domain", host)
+				return
+			}
+		}
+		if err := m.renewIfNeeded(ctx, host); err != nil {
+			m.logger.Warn("TLS: on-demand issue/renew failed", "domain", host, "renewal", isRenewal, "error", err)
+			return
+		}
+		if notAfter, ok := m.certCache.leafNotAfter(host); ok {
+			m.onDemand.noteIssued(ctx, host, notAfter)
+		}
+	}
+	for _, group := range []struct {
+		hosts     []string
+		isRenewal bool
+	}{{renewals, true}, {fresh, false}} {
+		for _, host := range group.hosts {
+			sem <- struct{}{}
+			wg.Add(1)
+			host, isRenewal := host, group.isRenewal
+			safego.Go(m.logger, "tls-ondemand-issue", func() { run(host, isRenewal) })
+		}
+	}
+	wg.Wait()
 }
 
 // reconcileCeremony completes a key-replacement ceremony that was interrupted

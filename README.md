@@ -140,6 +140,61 @@ lagging nodes still serving the old cert don't fail validation; an interrupted
 ceremony (crash between store and promote) is rolled forward idempotently by
 `reconcileCeremony` on the next leader tick.
 
+### On-demand hostnames (optional)
+
+Set `Config.OnDemand` and the fixed `Domains` whitelist gains a **dynamic
+allow-set** enumerated from an external authority — the shape a multi-tenant
+platform needs, where customers add vanity hostnames continuously and no config
+file can list them. The static list keeps its meaning: those are the platform's
+own names, always allowed, never dependent on the control plane being reachable.
+
+```go
+OnDemand: &certmanager.OnDemandConfig{
+    Enumerate:      func(ctx context.Context) ([]string, error) { ... },
+    Interval:       time.Minute,        // default 60s
+    ExpectedTarget: "mail.open.email",  // DNS pre-flight target
+    HandshakeWait:  20 * time.Second,   // 0 = original async behaviour
+}
+```
+
+A certificate authority's rate limits are a **shared, account-wide resource**,
+so the design question is not "can we issue for more names" but "can one name
+spend everyone's budget". Four mechanisms, layered so each catches what the
+previous cannot:
+
+1. **The allow-set is pushed, never queried per handshake.** The leader
+   enumerates and publishes to `ondemand/hosts.json`; followers read that one
+   small object. `GetCertificate` consults an in-memory set, so an SNI outside
+   it is refused with **no I/O at all** — a flood of invented server names costs
+   no storage read, no control-plane query, and no CA order.
+2. **A DNS pre-flight before any first issuance.** The hostname must actually
+   resolve to `ExpectedTarget` (by CNAME chain, or by sharing an address with
+   it). The common failure — a customer who has not published the CNAME yet, or
+   removed it — then costs **zero** CA budget instead of a failed validation,
+   and is backed off 24h rather than re-queried every tick.
+3. **A new-order token bucket** (`MaxNewOrdersPerHour`, default 40) bounds first
+   issuances per node per hour, so a thousand-hostname import drains over hours
+   instead of exhausting the account's new-order limit in minutes. Sized so that
+   even two believed-leaders in a split-brain stay under Let's Encrypt's 300
+   new orders per account per 3 hours.
+4. **Renewals are scheduled ahead of first issuances**, because when the budget
+   is scarce a working service staying up beats a new one starting.
+
+Maintenance for on-demand hostnames differs from the static loop in three ways
+that only matter at scale: every host gets its **own context** (one shared
+deadline would make later hosts fail with `context deadline exceeded` and charge
+that against their retry budgets), issuance runs **bounded-concurrent**
+(`MaxConcurrentOrders`, default 4), and followers refresh only what the leader's
+`ondemand/certs-index.json` says **changed** — O(1) storage reads per tick
+rather than one per hostname.
+
+`HandshakeWait` is the one deliberate exception to "never block a handshake".
+The client behind a vanity hostname is typically a person's mail app connecting
+to a name they configured seconds ago, where a failed connection is a support
+ticket and an MTA's invisible retry is not available. So a handshake for an
+**allowed** hostname may wait, bounded, for the issuance already in flight.
+Static domains are unaffected, and 0 keeps the original behaviour.
+
 ## Failure modes and guarantees
 
 - **Split-brain**: two believed-leaders are serialized by the storage lease.
@@ -156,6 +211,13 @@ ceremony (crash between store and promote) is rolled forward idempotently by
 - **Leadership flap during activation**: leadership is re-checked immediately
   before the destructive key promote; if lost, the promote aborts and the new
   leader rolls forward.
+- **Control plane down (on-demand)**: the last good allow-set is kept, so
+  certificates already serving traffic keep serving and keep renewing. A
+  hostname added during the outage is refused until enumeration recovers.
+- **Leader restart (on-demand)**: on-demand hostnames are not preloaded, so the
+  leader loads them from the shared index before classifying work — otherwise it
+  would read every one as a first issuance and spend the hour's new-order budget
+  re-obtaining certificates it already holds.
 
 ## Packages
 

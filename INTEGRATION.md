@@ -104,6 +104,36 @@ Semantics to know:
   objects (e.g. `cfg.Storage.S3Prefix`); pass `""` for none.
 - `KeyType` must stay constant once keys exist.
 
+## 3b. On-demand hostnames (multi-tenant vanity names)
+
+If customers bring their own hostnames, give the manager an enumerator instead
+of extending `Domains` (which is static and needs a restart):
+
+```go
+OnDemand: &certmanager.OnDemandConfig{
+    // Called on the LEADER only, every Interval. Make it cheap — a conditional
+    // request against your control plane. An error keeps the last good set.
+    Enumerate: func(ctx context.Context) ([]string, error) {
+        return coreClient.ListVerifiedHostnames(ctx, "mail")
+    },
+    ExpectedTarget: cfg.TLS.LetsEncrypt.Domains[0], // what customers CNAME at
+    HandshakeWait:  20 * time.Second,               // interactive clients
+},
+```
+
+Two rules for the authority behind `Enumerate`:
+
+- **Return only hostnames whose DNS you have verified points at you.** The
+  module's DNS pre-flight is a second line of defence, not the first: a set full
+  of unpointed names still costs a lookup each and delays the ones that work.
+- **Never let the enumeration be a per-hostname question.** The whole
+  rate-limit story rests on the allow-set being pushed; adding a
+  "is this SNI allowed?" call to the handshake path reintroduces exactly the
+  amplification this design removes.
+
+Followers need no credentials for the control plane — they read the set the
+leader published to shared storage.
+
 ## 4. Challenge listeners (every node)
 
 Both listeners run on **all** nodes — the CA may validate against any of them.

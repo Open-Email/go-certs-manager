@@ -35,6 +35,16 @@ type Config struct {
 	// every maintenance tick: matched is true when the TLSA records published in
 	// DNS exactly match the desired set. Wire it to a metrics gauge.
 	OnDANEPublishedMatch func(host string, matched bool)
+
+	// OnDemand, when set, adds a DYNAMIC allow-set on top of the static
+	// LetsEncrypt.Domains whitelist: hostnames enumerated from an external
+	// authority (a multi-tenant control plane) are served and renewed exactly
+	// like configured ones, without a config change or a restart.
+	//
+	// The static list keeps its meaning — those are the platform's own names,
+	// always allowed, never dependent on the control plane being reachable. See
+	// OnDemandConfig for the rate-limit reasoning that shapes the rest.
+	OnDemand *OnDemandConfig
 }
 
 // LetsEncryptConfig configures Let's Encrypt certificate provisioning. Certificates
@@ -78,6 +88,8 @@ type Manager struct {
 	renewBefore   time.Duration
 	checkInterval time.Duration
 	isLeaderF     func() bool
+
+	onDemand *onDemand // dynamic allow-set (nil when not configured)
 
 	tlsConfig   *tls.Config
 	leaser      *issueLeaser // cluster-wide issuance lease (split-brain guard)
@@ -199,11 +211,19 @@ func NewManager(ctx context.Context, cfg *Config, backend storage.Backend, prefi
 		stopCh:        make(chan struct{}),
 		doneCh:        make(chan struct{}),
 	}
+	if cfg.OnDemand != nil {
+		m.onDemand = newOnDemand(*cfg.OnDemand, backend, prefix)
+	}
 	m.tlsConfig = m.buildTLSConfig()
 
 	// Preload any certs already in storage so we can serve immediately, then run
 	// maintenance (leader: issue/renew; follower: refresh) in the background.
 	m.preload(ctx)
+	// The allow-set is fetched BEFORE the first maintenance pass so a restarting
+	// node issues/renews its on-demand hostnames on that pass rather than idling
+	// a full interval; it is also its own loop, at its own (faster) cadence.
+	m.refreshAllowSetIfConfigured(ctx)
+	m.startOnDemand()
 	m.startMaintenance()
 
 	logger.Info("TLS manager initialized",
@@ -219,6 +239,27 @@ func NewManager(ctx context.Context, cfg *Config, backend storage.Backend, prefi
 
 func (m *Manager) isLeader() bool {
 	return m.isLeaderF == nil || m.isLeaderF()
+}
+
+// refreshAllowSetIfConfigured does one synchronous allow-set fetch during
+// construction, bounded so a slow or down control plane delays startup by
+// seconds rather than blocking it: an empty allow-set only means on-demand
+// hostnames are refused until the first loop tick, while the platform's own
+// static domains are unaffected.
+func (m *Manager) refreshAllowSetIfConfigured(ctx context.Context) {
+	if m.onDemand == nil {
+		return
+	}
+	loadCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+	if m.isLeader() {
+		m.onDemand.hydrateIndex(loadCtx)
+		m.onDemand.refreshLeader(loadCtx, m.logger)
+		return
+	}
+	if err := m.onDemand.refreshFollower(loadCtx); err != nil {
+		m.logger.Debug("TLS: no published on-demand allow-set yet", "error", err)
+	}
 }
 
 // ensureIssuer lazily builds the ACME issuer (and registers the account) the first
@@ -278,11 +319,19 @@ func (m *Manager) buildTLSConfig() *tls.Config {
 			serverName = strings.ToLower(m.defaultDomain)
 		}
 
+		// The static whitelist first, then the dynamic allow-set. BOTH are pure
+		// memory: an SNI in neither is refused here without a single byte of I/O,
+		// which is what makes a flood of invented server names free — no storage
+		// read, no control-plane query, and above all no CA order.
+		onDemandHost := false
 		if !m.domainSet[serverName] {
-			return nil, fmt.Errorf("%w: %s", ErrHostNotAllowed, serverName)
+			if m.onDemand == nil || !m.onDemand.allows(serverName) {
+				return nil, fmt.Errorf("%w: %s", ErrHostNotAllowed, serverName)
+			}
+			onDemandHost = true
 		}
 
-		cert, err := m.getCertificate(serverName)
+		cert, err := m.getCertificate(serverName, onDemandHost)
 		if err != nil {
 			m.logger.Error("TLS: failed to get certificate", "server_name", serverName, "error", err)
 			return nil, fmt.Errorf("%w for %s: %v", ErrCertificateUnavailable, serverName, err)
@@ -301,13 +350,45 @@ func (m *Manager) buildTLSConfig() *tls.Config {
 // "unavailable" immediately (the sending MTA retries; maintenance fills the cache),
 // so a slow CA can't stall handshakes for minutes. Followers do a throttled,
 // deduplicated storage refresh.
-func (m *Manager) getCertificate(domain string) (*tls.Certificate, error) {
+//
+// ON-DEMAND hostnames get one bounded exception, when HandshakeWait is set. The
+// client behind them is typically a person's mail app connecting to a hostname
+// they configured seconds ago, and "connection failed, try again" is a support
+// ticket where an MTA's retry is invisible. So the handshake WAITS for the
+// issuance already in flight — bounded, so a slow CA costs one client one
+// timeout rather than the fleet's handshake capacity, and only for names the
+// allow-set already vouched for.
+func (m *Manager) getCertificate(domain string, onDemandHost bool) (*tls.Certificate, error) {
 	if cert, ok := m.certCache.Get(domain); ok {
 		return cert, nil
 	}
 
+	wait := time.Duration(0)
+	if onDemandHost && m.onDemand != nil {
+		wait = m.onDemand.cfg.HandshakeWait
+	}
+
 	if m.isLeader() {
+		// An on-demand hostname is not in preload() (the static list is), so a
+		// leader that just restarted has a perfectly good certificate in storage
+		// and nothing in memory. Ordering a new one for it would spend a CA order
+		// to re-obtain what we already hold — check storage first, exactly as a
+		// follower does. Static domains skip this: preload already covered them,
+		// so a miss there really is "not issued yet".
+		if onDemandHost {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			cert, err := m.certCache.Refresh(ctx, domain)
+			cancel()
+			if err == nil {
+				return cert, nil
+			}
+		}
 		m.requestIssue(domain) // async, deduplicated
+		if wait > 0 {
+			if cert, ok := m.awaitCertificate(domain, wait); ok {
+				return cert, nil
+			}
+		}
 		return nil, fmt.Errorf("%w: issuance in progress for %s", ErrCertificateUnavailable, domain)
 	}
 
@@ -318,6 +399,11 @@ func (m *Manager) getCertificate(domain string) (*tls.Certificate, error) {
 		return cert, nil
 	}
 	if m.certCache.recentMiss(domain) {
+		if wait > 0 {
+			if cert, ok := m.awaitCertificate(domain, wait); ok {
+				return cert, nil
+			}
+		}
 		return nil, fmt.Errorf("%w: %s not yet issued by leader", ErrCertificateUnavailable, domain)
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -325,9 +411,49 @@ func (m *Manager) getCertificate(domain string) (*tls.Certificate, error) {
 	cert, err := m.certCache.Refresh(ctx, domain)
 	if err != nil {
 		m.certCache.noteMiss(domain)
+		if wait > 0 {
+			if cert, ok := m.awaitCertificate(domain, wait); ok {
+				return cert, nil
+			}
+		}
 		return nil, fmt.Errorf("%w: %s not yet available (follower): %v", ErrCertificateUnavailable, domain, err)
 	}
 	return cert, nil
+}
+
+// awaitCertificate polls for a certificate appearing for `domain` within
+// `limit`, from the in-memory cache (leader, filled by the issuance it just
+// kicked) or from storage (follower, filled by the leader's issuance).
+//
+// Polling rather than a completion channel, deliberately: the certificate can
+// arrive from ANOTHER node, so there is no local future to wait on, and a poll
+// costs one small read per second against a bound measured in seconds.
+func (m *Manager) awaitCertificate(domain string, limit time.Duration) (*tls.Certificate, bool) {
+	deadline := time.Now().Add(limit)
+	leader := m.isLeader()
+	for {
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return nil, false
+		}
+		sleep := time.Second
+		if remaining < sleep {
+			sleep = remaining
+		}
+		time.Sleep(sleep)
+		if cert, ok := m.certCache.Get(domain); ok {
+			return cert, true
+		}
+		if leader {
+			continue // the issuance we kicked publishes into the cache directly
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		cert, err := m.certCache.Refresh(ctx, domain)
+		cancel()
+		if err == nil {
+			return cert, true
+		}
+	}
 }
 
 // requestIssue triggers asynchronous issuance for a domain on the leader,
