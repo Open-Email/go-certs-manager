@@ -152,18 +152,10 @@ own names, always allowed, never dependent on the control plane being reachable.
 OnDemand: &certmanager.OnDemandConfig{
     Enumerate:      func(ctx context.Context) ([]string, error) { ... },
     Interval:       time.Minute,        // default 60s
-    ExpectedTarget: "mail.hostedemail.app",       // DNS pre-flight target (advertised)
-    ExpectedTargets: []string{"mail.open.email"}, // legacy names still accepted
-    HandshakeWait:  20 * time.Second,             // 0 = original async behaviour
+    ExpectedTarget: "mail.open.email",  // DNS pre-flight target
+    HandshakeWait:  20 * time.Second,   // 0 = original async behaviour
 }
 ```
-
-`ExpectedTargets` exists because the advertised target lives in **customers'**
-DNS and can never be retired on your schedule. Renaming it is an **add**, not a
-replace: advertise the new name, keep the old one accepted, and drop it only
-once nothing resolves there — otherwise every hostname still pointed at the old
-name fails pre-flight, and that stops its **renewals**, so it goes dark at
-certificate expiry rather than at the rename.
 
 A certificate authority's rate limits are a **shared, account-wide resource**,
 so the design question is not "can we issue for more names" but "can one name
@@ -176,8 +168,8 @@ previous cannot:
    it is refused with **no I/O at all** — a flood of invented server names costs
    no storage read, no control-plane query, and no CA order.
 2. **A DNS pre-flight before any first issuance.** The hostname must actually
-   resolve to `ExpectedTarget` or one of `ExpectedTargets` (by CNAME chain, or
-   by sharing an address with it). The common failure — a customer who has not published the CNAME yet, or
+   resolve to `ExpectedTarget` (by CNAME chain, or by sharing an address with
+   it). The common failure — a customer who has not published the CNAME yet, or
    removed it — then costs **zero** CA budget instead of a failed validation,
    and is backed off 24h rather than re-queried every tick.
 3. **A new-order token bucket** (`MaxNewOrdersPerHour`, default 40) bounds first

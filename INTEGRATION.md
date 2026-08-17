@@ -116,16 +116,10 @@ OnDemand: &certmanager.OnDemandConfig{
     Enumerate: func(ctx context.Context) ([]string, error) {
         return coreClient.ListVerifiedHostnames(ctx, "mail")
     },
-    ExpectedTarget:  cfg.TLS.LetsEncrypt.OnDemand.ExpectedTarget,  // what customers CNAME at
-    ExpectedTargets: cfg.TLS.LetsEncrypt.OnDemand.ExpectedTargets, // legacy names still accepted
-    HandshakeWait:   20 * time.Second,                             // interactive clients
+    ExpectedTarget: cfg.TLS.LetsEncrypt.Domains[0], // what customers CNAME at
+    HandshakeWait:  20 * time.Second,               // interactive clients
 },
 ```
-
-Every name in `ExpectedTarget`/`ExpectedTargets` must ALSO be in the static
-`Domains` list: the fleet has to hold a certificate for the target itself before
-any customer CNAMEs at it, and the on-demand path never issues for a name it is
-told to expect rather than to serve.
 
 Two rules for the authority behind `Enumerate`:
 

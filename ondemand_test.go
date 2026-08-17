@@ -10,7 +10,6 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"strings"
 	"testing"
 	"time"
 
@@ -407,63 +406,5 @@ func TestOnDemand_PreflightFailsOpenOnResolverError(t *testing.T) {
 	od.resolveFn = func(context.Context, string, string) string { return "" }
 	if ok, reason := od.preflightOK(context.Background(), "mail.acme.com"); !ok {
 		t.Fatalf("expected the pre-flight to pass, got %q", reason)
-	}
-}
-
-// A platform rename is an ADD, never a replace: the advertised target lives in
-// customers' DNS, so a hostname still pointed at the old name must keep passing
-// pre-flight — otherwise the rename stops its RENEWALS and it goes dark at
-// certificate expiry, months after anyone touched anything.
-func TestOnDemand_PreflightAcceptsLegacyTargets(t *testing.T) {
-	backend, err := storage.NewFilesystemBackend(t.TempDir(), nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	od := newOnDemand(OnDemandConfig{
-		ExpectedTarget:  "mail.hostedemail.app",
-		ExpectedTargets: []string{"mail.open.email", "MAIL.HOSTEDEMAIL.APP."}, // dup + case + anchor
-	}, backend, "")
-
-	if got := od.expectedTargets(); len(got) != 2 || got[0] != "mail.hostedemail.app" || got[1] != "mail.open.email" {
-		t.Fatalf("want [advertised, legacy] normalized and de-duplicated, got %v", got)
-	}
-
-	// Pointed at the LEGACY name: must pass.
-	od.resolveFn = func(_ context.Context, _ string, target string) string {
-		if target == "mail.open.email" {
-			return ""
-		}
-		return "CNAME points at mail.open.email, want " + target
-	}
-	if ok, reason := od.preflightOK(context.Background(), "mail.acme.com"); !ok {
-		t.Fatalf("a hostname on the legacy target must pass pre-flight, got %q", reason)
-	}
-
-	// Pointed at neither: fails, and the reason names the ADVERTISED target,
-	// since that is what the customer's instructions say to publish.
-	od.resolveFn = func(_ context.Context, _ string, target string) string {
-		return "CNAME points at ghs.googlehosted.com, want " + target
-	}
-	ok, reason := od.preflightOK(context.Background(), "mail.other.com")
-	if ok {
-		t.Fatal("a hostname pointed elsewhere must fail pre-flight")
-	}
-	if !strings.Contains(reason, "want mail.hostedemail.app") {
-		t.Fatalf("the failure reason must name the advertised target, got %q", reason)
-	}
-}
-
-// With no targets configured at all, the pre-flight is disabled — the
-// documented (and discouraged) shape — and must not start refusing just
-// because the list form exists.
-func TestOnDemand_PreflightDisabledWithNoTargets(t *testing.T) {
-	backend, err := storage.NewFilesystemBackend(t.TempDir(), nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	od := newOnDemand(OnDemandConfig{}, backend, "")
-	od.resolveFn = func(context.Context, string, string) string { return "never consulted" }
-	if ok, _ := od.preflightOK(context.Background(), "mail.acme.com"); !ok {
-		t.Fatal("no targets means no pre-flight")
 	}
 }
