@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -62,10 +63,22 @@ type OnDemandConfig struct {
 
 	// ExpectedTarget is the platform hostname customers CNAME at. The DNS
 	// pre-flight requires an on-demand hostname to resolve to it — by CNAME
-	// chain, or by sharing an address with it. Empty disables the pre-flight,
-	// which is NOT recommended: it is the only thing standing between an
-	// unpointed hostname and a failed CA order.
+	// chain, or by sharing an address with it. Empty (and no ExpectedTargets)
+	// disables the pre-flight, which is NOT recommended: it is the only thing
+	// standing between an unpointed hostname and a failed CA order.
 	ExpectedTarget string
+
+	// ExpectedTargets are ADDITIONAL names the pre-flight accepts, checked after
+	// ExpectedTarget. It exists because the advertised target is a value that
+	// lives in customers' DNS and can therefore never be retired on our
+	// schedule: renaming it to a new platform domain leaves every hostname
+	// already pointed at the old name failing pre-flight, which does not just
+	// stall new issuance — it stops RENEWALS, so working customer hostnames go
+	// dark at their certificate's expiry rather than at the rename.
+	//
+	// So a rename is an ADD: advertise the new name, list the old one here, and
+	// remove it only once nothing resolves to it any more.
+	ExpectedTargets []string
 
 	// HandshakeWait, when > 0, lets a handshake for an allowed-but-not-yet-issued
 	// hostname WAIT for issuance instead of failing immediately. It exists for
@@ -410,7 +423,8 @@ func (o *onDemand) noteRefreshed(ctx context.Context, hostname string) {
 // failed validation against a shared account limit every time. One DNS lookup
 // per DUE issuance replaces that with nothing.
 func (o *onDemand) preflightOK(ctx context.Context, hostname string) (bool, string) {
-	if o.cfg.ExpectedTarget == "" {
+	targets := o.expectedTargets()
+	if len(targets) == 0 {
 		return true, ""
 	}
 	o.mu.Lock()
@@ -420,18 +434,47 @@ func (o *onDemand) preflightOK(ctx context.Context, hostname string) (bool, stri
 		return false, "recent DNS pre-flight failure"
 	}
 
-	target := strings.TrimSuffix(strings.ToLower(o.cfg.ExpectedTarget), ".")
-	reason := o.resolveFn(ctx, hostname, target)
-	if reason == "" {
-		o.mu.Lock()
-		delete(o.preflight, hostname)
-		o.mu.Unlock()
-		return true, ""
+	// Any accepted target satisfies it. The FIRST target's reason is the one
+	// reported on failure: it is the advertised one, so it is the name the
+	// operator's docs and the customer's instructions both say, and reporting a
+	// legacy alternate's mismatch would send someone to fix the wrong record.
+	var reason string
+	for i, target := range targets {
+		r := o.resolveFn(ctx, hostname, target)
+		if r == "" {
+			o.mu.Lock()
+			delete(o.preflight, hostname)
+			o.mu.Unlock()
+			return true, ""
+		}
+		if i == 0 {
+			reason = r
+		}
 	}
 	o.mu.Lock()
 	o.preflight[hostname] = time.Now().Add(preflightBackoff)
 	o.mu.Unlock()
 	return false, reason
+}
+
+// expectedTargets is the advertised target followed by any accepted legacy
+// ones, lower-cased and de-anchored once so the comparison never has to.
+func (o *onDemand) expectedTargets() []string {
+	out := make([]string, 0, 1+len(o.cfg.ExpectedTargets))
+	for _, t := range append([]string{o.cfg.ExpectedTarget}, o.cfg.ExpectedTargets...) {
+		t = strings.TrimSuffix(strings.ToLower(strings.TrimSpace(t)), ".")
+		if t == "" {
+			continue
+		}
+		// A duplicate would double the DNS work on every failed pre-flight for
+		// no gain, and a config that lists the advertised name again is the
+		// obvious way to write "keep accepting this".
+		if slices.Contains(out, t) {
+			continue
+		}
+		out = append(out, t)
+	}
+	return out
 }
 
 // resolvesTo returns "" when hostname resolves to target, else why not.
