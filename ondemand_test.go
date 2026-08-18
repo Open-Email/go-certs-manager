@@ -10,6 +10,8 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
+	"os"
 	"testing"
 	"time"
 
@@ -406,5 +408,146 @@ func TestOnDemand_PreflightFailsOpenOnResolverError(t *testing.T) {
 	od.resolveFn = func(context.Context, string, string) string { return "" }
 	if ok, reason := od.preflightOK(context.Background(), "mail.acme.com"); !ok {
 		t.Fatalf("expected the pre-flight to pass, got %q", reason)
+	}
+}
+
+// The pre-flight must tell "we could not look it up" from "it does not exist".
+// The first fails open (the CA validates independently, and a SERVFAIL must
+// not lock a working hostname out for a day); the second is the definite
+// answer that no order can succeed — and the most common shape of an
+// abandoned hostname, since a deleted record is invisible to the allow-set.
+func TestOnDemand_PreflightNXDOMAINIsDefinite(t *testing.T) {
+	backend, err := storage.NewFilesystemBackend(t.TempDir(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	od := newOnDemand(OnDemandConfig{ExpectedTarget: "mail.open.email"}, backend, "")
+	od.lookupCNAME = func(context.Context, string) (string, error) {
+		return "", &net.DNSError{Err: "no such host", IsNotFound: true}
+	}
+	od.lookupHost = func(_ context.Context, host string) ([]string, error) {
+		if host == "mail.open.email" {
+			return []string{"192.0.2.10"}, nil
+		}
+		return nil, &net.DNSError{Err: "no such host", Name: host, IsNotFound: true}
+	}
+	ctx := context.Background()
+	if ok, reason := od.preflightOK(ctx, "gone.acme.com"); ok || reason == "" {
+		t.Fatalf("an NXDOMAIN hostname must be refused with a reason, got ok=%v reason=%q", ok, reason)
+	}
+	// And remembered: the next tick must not re-query it.
+	calls := 0
+	od.lookupHost = func(_ context.Context, host string) ([]string, error) {
+		calls++
+		return []string{"192.0.2.10"}, nil
+	}
+	if ok, _ := od.preflightOK(ctx, "gone.acme.com"); ok || calls != 0 {
+		t.Fatalf("NXDOMAIN must enter the backoff like any other definite miss (ok=%v lookups=%d)", ok, calls)
+	}
+
+	// The same lookup failing for any OTHER reason is "cannot tell": fail open.
+	servfail := newOnDemand(OnDemandConfig{ExpectedTarget: "mail.open.email"}, backend, "")
+	servfail.lookupCNAME = od.lookupCNAME
+	servfail.lookupHost = func(_ context.Context, host string) ([]string, error) {
+		if host == "mail.open.email" {
+			return []string{"192.0.2.10"}, nil
+		}
+		return nil, &net.DNSError{Err: "server misbehaving", Name: host, IsTemporary: true}
+	}
+	if ok, reason := servfail.preflightOK(ctx, "flaky.acme.com"); !ok {
+		t.Fatalf("a resolver failure must fail open, got %q", reason)
+	}
+}
+
+// A hostname that leaves the customer's DNS does not leave the allow-set on
+// its own — only an explicit check at the authority does that. So the renewal
+// path, not just first issuance, must run the pre-flight: renewing blind for a
+// name that no longer points here is a failed order every retry, forever,
+// against the account limit the static names share.
+func TestOnDemand_RenewalRunsPreflight(t *testing.T) {
+	backend, err := storage.NewFilesystemBackend(t.TempDir(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := newOnDemandManager(t, backend, true, OnDemandConfig{ExpectedTarget: "mail.open.email"})
+	m.renewBefore = 30 * 24 * time.Hour // the seeded 24h certificate is DUE
+	m.onDemand.store([]string{"stale.acme.com"})
+
+	key, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	cert, err := buildCertificate(selfSignedChainPEM(t, key, "stale.acme.com"), key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.certCache.set("stale.acme.com", cert)
+
+	preflights := 0
+	m.onDemand.resolveFn = func(_ context.Context, host, _ string) string {
+		preflights++
+		return "does not resolve"
+	}
+	m.maintainOnDemand(true)
+
+	if preflights != 1 {
+		t.Fatalf("a due renewal must be pre-flighted exactly once, got %d", preflights)
+	}
+	m.onDemand.mu.Lock()
+	_, backedOff := m.onDemand.preflight["stale.acme.com"]
+	m.onDemand.mu.Unlock()
+	if !backedOff {
+		t.Fatal("a failed renewal pre-flight must enter the backoff")
+	}
+	// The proof that no order was attempted: issuance begins by minting the
+	// certificate key, and none exists.
+	if _, err := m.keyStore.LoadCertKey(context.Background(), "stale.acme.com"); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("no issuance may run behind a failed pre-flight (key lookup: %v)", err)
+	}
+	// And the new-order budget was not touched: a renewal never takes a token.
+	if len(m.onDemand.orders.events) != 0 {
+		t.Fatalf("a renewal must not consume the new-order budget, got %d events", len(m.onDemand.orders.events))
+	}
+}
+
+// "Keep the last good set on error" only means something once a set exists.
+// A leader that has just started, whose authority is down in that same
+// window, must fall back to the set that was PUBLISHED — the one every
+// follower is serving from — rather than refuse every on-demand hostname
+// until the authority recovers.
+func TestOnDemand_FreshLeaderFallsBackToPublishedSet(t *testing.T) {
+	backend, err := storage.NewFilesystemBackend(t.TempDir(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	previous := newOnDemand(OnDemandConfig{
+		Enumerate: func(context.Context) ([]string, error) { return []string{"a.acme.com"}, nil },
+	}, backend, "")
+	previous.refreshLeader(ctx, slog.Default())
+
+	down := errors.New("control plane down")
+	restarted := newOnDemand(OnDemandConfig{
+		Enumerate: func(context.Context) ([]string, error) { return nil, down },
+	}, backend, "")
+	if restarted.allows("a.acme.com") {
+		t.Fatal("precondition: a fresh process holds no set")
+	}
+	restarted.refreshLeader(ctx, slog.Default())
+	if !restarted.allows("a.acme.com") {
+		t.Fatal("a fresh leader with an unreachable authority must serve the published set")
+	}
+
+	// Once the authority answers, the leader's own view takes over — and a
+	// changed set is published for the followers, even though this process
+	// never published before.
+	restarted.cfg.Enumerate = func(context.Context) ([]string, error) { return []string{"b.acme.com"}, nil }
+	restarted.refreshLeader(ctx, slog.Default())
+	if restarted.allows("a.acme.com") || !restarted.allows("b.acme.com") {
+		t.Fatal("a successful enumeration must replace the fallback set")
+	}
+	follower := newOnDemand(OnDemandConfig{}, backend, "")
+	if err := follower.refreshFollower(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if !follower.allows("b.acme.com") {
+		t.Fatal("the recovered leader must publish for the followers")
 	}
 }

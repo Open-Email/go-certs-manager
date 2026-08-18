@@ -167,11 +167,19 @@ previous cannot:
    small object. `GetCertificate` consults an in-memory set, so an SNI outside
    it is refused with **no I/O at all** — a flood of invented server names costs
    no storage read, no control-plane query, and no CA order.
-2. **A DNS pre-flight before any first issuance.** The hostname must actually
-   resolve to `ExpectedTarget` (by CNAME chain, or by sharing an address with
-   it). The common failure — a customer who has not published the CNAME yet, or
-   removed it — then costs **zero** CA budget instead of a failed validation,
-   and is backed off 24h rather than re-queried every tick.
+2. **A DNS pre-flight before EVERY order — renewals included.** The hostname
+   must actually resolve to `ExpectedTarget` (by CNAME chain, or by sharing an
+   address with it). The common failure — a customer who has not published the
+   CNAME yet, or removed it — then costs **zero** CA budget instead of a failed
+   validation, and is backed off 24h rather than re-queried every tick. A name
+   that does not exist at all (NXDOMAIN, or no address records) is a DEFINITE
+   miss and enters that backoff; only a resolver *failure* (SERVFAIL, timeout)
+   fails open, because the CA validates independently and a working hostname
+   must not be locked out for a day over one bad answer. Renewals matter here
+   because a hostname leaves the allow-set only when the authority notices its
+   DNS changed — a deleted record is invisible to it — so a renewal for an
+   abandoned name would otherwise retry, and fail, for as long as the name is
+   enumerated. (v0.5.2; earlier versions pre-flighted first issuances only.)
 3. **A new-order token bucket** (`MaxNewOrdersPerHour`, default 40) bounds first
    issuances per node per hour, so a thousand-hostname import drains over hours
    instead of exhausting the account's new-order limit in minutes. Sized so that

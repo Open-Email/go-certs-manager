@@ -79,6 +79,8 @@ func (m *Manager) maintainOnce() {
 //     orders would let one slow CA response set the pace for the whole set.
 //   - RENEWALS GO FIRST. When the new-order budget is the scarce resource, a
 //     working service staying up beats a new one starting.
+//   - The DNS pre-flight runs before EVERY order, renewals included; only the
+//     new-order token bucket is first-issuance-only. See the loop body.
 //   - Followers refresh only what the leader's index says CHANGED, instead of
 //     one storage read per hostname per tick.
 func (m *Manager) maintainOnDemand(leader bool) {
@@ -156,18 +158,27 @@ func (m *Manager) maintainOnDemand(leader bool) {
 		ctx, cancel := context.WithTimeout(context.Background(), issueTimeout)
 		defer cancel()
 
-		if !isRenewal {
-			// A first issuance for a name that does not point at us yet is the
-			// common case, and the one that costs a failed validation against a
-			// shared account limit. One DNS lookup replaces that with nothing.
-			if ok, reason := m.onDemand.preflightOK(ctx, host); !ok {
-				m.logger.Debug("TLS: on-demand issuance skipped — DNS pre-flight", "domain", host, "reason", reason)
-				return
-			}
-			if !m.onDemand.orders.take() {
-				m.logger.Info("TLS: on-demand new-order budget exhausted for this hour — deferring", "domain", host)
-				return
-			}
+		// The pre-flight guards RENEWALS TOO. A renewal for a name that no
+		// longer points here cannot succeed, so the lookup is pure savings; and
+		// unlike a first issuance it is the case nothing else bounds. A hostname
+		// leaves the allow-set only when the authority notices its DNS changed,
+		// which happens on someone's explicit check and not otherwise — so a
+		// customer who verified a hostname, got a certificate, and then quietly
+		// deleted the record stays enumerated indefinitely. Renewing it blind
+		// made every such hostname a permanent failed-order loop bounded only
+		// by the per-host retry budget, all of it charged to the account limit
+		// the platform's own static names renew under. A failed pre-flight
+		// costs the renewal a 24-hour backoff, which a 30-day window absorbs
+		// without anyone noticing.
+		if ok, reason := m.onDemand.preflightOK(ctx, host); !ok {
+			m.logger.Debug("TLS: on-demand issue/renew skipped — DNS pre-flight", "domain", host, "renewal", isRenewal, "reason", reason)
+			return
+		}
+		// The new-order budget stays first-issuance only: renewals are bounded
+		// by certificate lifetime and must never be starved by an import.
+		if !isRenewal && !m.onDemand.orders.take() {
+			m.logger.Info("TLS: on-demand new-order budget exhausted for this hour — deferring", "domain", host)
+			return
 		}
 		if err := m.renewIfNeeded(ctx, host); err != nil {
 			m.logger.Warn("TLS: on-demand issue/renew failed", "domain", host, "renewal", isRenewal, "error", err)

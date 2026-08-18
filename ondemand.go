@@ -3,6 +3,7 @@ package certmanager
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -133,6 +134,12 @@ type onDemand struct {
 	// resolveFn is the pre-flight's resolution decision, injectable for tests
 	// (it returns "" when the hostname points at the target, else why not).
 	resolveFn func(ctx context.Context, hostname, target string) string
+	// The two DNS primitives resolveFn's default implementation is built from,
+	// injectable separately so the CLASSIFICATION of a lookup error — the part
+	// that decides whether a failure is "cannot tell" or "definitely not
+	// pointed here" — can be tested without a resolver.
+	lookupCNAME func(ctx context.Context, host string) (string, error)
+	lookupHost  func(ctx context.Context, host string) ([]string, error)
 
 	mu           sync.Mutex
 	published    string               // last set the leader wrote, joined — change detection
@@ -164,6 +171,8 @@ func newOnDemand(cfg OnDemandConfig, backend storage.Backend, prefix string) *on
 		preflight: make(map[string]time.Time),
 	}
 	od.resolveFn = od.resolvesTo
+	od.lookupCNAME = resolver.LookupCNAME
+	od.lookupHost = resolver.LookupHost
 	empty := make(map[string]struct{})
 	od.allow.Store(&empty)
 	return od
@@ -231,6 +240,23 @@ func (o *onDemand) refreshLeader(ctx context.Context, logger interface{ Warn(str
 	}
 	hosts, err := o.cfg.Enumerate(ctx)
 	if err != nil {
+		// "Keep the previous set" is only a promise once there IS one. A leader
+		// that has just started holds nothing in memory, so an authority that
+		// is unreachable in that window — a deploy during a control-plane
+		// incident, a rotated credential — would leave every on-demand hostname
+		// refused at the handshake until it recovers, while the followers keep
+		// serving from the set this same node (or its predecessor) published.
+		// That published object IS the last good set; a fresh leader reads it
+		// exactly as a follower would, and re-publishes once it can enumerate.
+		o.mu.Lock()
+		fresh := !o.hasPublished
+		o.mu.Unlock()
+		if fresh {
+			if ferr := o.refreshFollower(ctx); ferr == nil {
+				logger.Warn("TLS: on-demand enumeration failed — serving the last PUBLISHED allow-set until the authority answers", "error", err)
+				return
+			}
+		}
 		logger.Warn("TLS: on-demand enumeration failed — keeping the previous allow-set", "error", err)
 		return
 	}
@@ -442,27 +468,42 @@ func (o *onDemand) resolvesTo(ctx context.Context, hostname, target string) stri
 	lookupCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 
-	cname, err := o.resolver.LookupCNAME(lookupCtx, hostname)
+	cname, err := o.lookupCNAME(lookupCtx, hostname)
 	if err == nil {
 		if strings.TrimSuffix(strings.ToLower(cname), ".") == target {
 			return ""
 		}
 	}
-	ours, err := o.resolver.LookupHost(lookupCtx, target)
+	ours, err := o.lookupHost(lookupCtx, target)
 	if err != nil {
 		// We cannot tell — do NOT record a failure. Failing open here is safe
 		// because the CA still validates; failing closed on our own resolver
 		// trouble would stop issuing for correctly configured customers.
 		return ""
 	}
-	theirs, err := o.resolver.LookupHost(lookupCtx, hostname)
+	theirs, err := o.lookupHost(lookupCtx, hostname)
 	if err != nil {
-		// FAIL OPEN, exactly as a failure on the target side does. A lookup error
-		// is "we cannot tell", not "the customer unpointed it" — and treating it
-		// as the latter locked a demonstrably-working hostname out of issuance
-		// for a full backoff window over one SERVFAIL. The CA validates
-		// independently, so the cost of being wrong in this direction is one
-		// failed order rather than a day of outage.
+		// Two kinds of failure, and they must NOT be treated alike:
+		//
+		//  - The name DOES NOT EXIST (NXDOMAIN), or exists with no address at
+		//    all (NODATA). That is not "we cannot tell" — it is the definite
+		//    answer that nothing can connect to this hostname, so a CA order
+		//    for it fails validation with certainty. It is also the most
+		//    common shape of an abandoned hostname: the customer deleted the
+		//    record (or the zone) and nothing on our side hears about it, so
+		//    the name stays in the allow-set and comes up for renewal forever.
+		//    Passing it here turned every such hostname into a permanent
+		//    failed-order loop against the shared account limit.
+		//  - Anything else (SERVFAIL, timeout, a broken resolver) IS "we
+		//    cannot tell", and FAILS OPEN exactly as a failure on the target
+		//    side does: treating it as "unpointed" locked a demonstrably
+		//    working hostname out of issuance for a full backoff window over
+		//    one SERVFAIL. The CA validates independently, so the cost of
+		//    being wrong in this direction is one failed order, not a day of
+		//    outage.
+		if lookupSaysAbsent(err) {
+			return "does not resolve (NXDOMAIN or no address records)"
+		}
 		return ""
 	}
 	ourSet := make(map[string]struct{}, len(ours))
@@ -475,6 +516,17 @@ func (o *onDemand) resolvesTo(ctx context.Context, hostname, target string) stri
 		}
 	}
 	return fmt.Sprintf("resolves to %v, not to %s", theirs, target)
+}
+
+// lookupSaysAbsent reports whether a resolver error is the DEFINITE answer
+// that the name has no addresses — NXDOMAIN, or NODATA for A/AAAA — as opposed
+// to a failure to find out. Go's resolver folds both into IsNotFound (a
+// name that exists but has no address records is "no such host" to it, and
+// that is the right reading here: a hostname nobody can connect to cannot
+// pass a certificate authority's validation either).
+func lookupSaysAbsent(err error) bool {
+	var dnsErr *net.DNSError
+	return errors.As(err, &dnsErr) && dnsErr.IsNotFound
 }
 
 // tokenBucket is a simple sliding-window counter: at most `max` events per

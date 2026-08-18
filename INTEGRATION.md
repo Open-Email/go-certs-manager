@@ -112,7 +112,10 @@ of extending `Domains` (which is static and needs a restart):
 ```go
 OnDemand: &certmanager.OnDemandConfig{
     // Called on the LEADER only, every Interval. Make it cheap — a conditional
-    // request against your control plane. An error keeps the last good set.
+    // request against your control plane. An error keeps the last good set;
+    // a leader that has JUST STARTED and cannot reach you falls back to the
+    // set it (or its predecessor) last published, so a deploy during a
+    // control-plane incident does not refuse every vanity hostname.
     Enumerate: func(ctx context.Context) ([]string, error) {
         return coreClient.ListVerifiedHostnames(ctx, "mail")
     },
@@ -126,6 +129,10 @@ Two rules for the authority behind `Enumerate`:
 - **Return only hostnames whose DNS you have verified points at you.** The
   module's DNS pre-flight is a second line of defence, not the first: a set full
   of unpointed names still costs a lookup each and delays the ones that work.
+  Expect, though, that your verification goes STALE — a customer who deletes a
+  record tells nobody — and that is why the module pre-flights renewals too:
+  an abandoned name you keep enumerating costs one DNS lookup per day, not a
+  failed order per retry.
 - **Never let the enumeration be a per-hostname question.** The whole
   rate-limit story rests on the allow-set being pushed; adding a
   "is this SNI allowed?" call to the handshake path reintroduces exactly the
