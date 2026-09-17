@@ -212,7 +212,11 @@ For admin CLIs (`smtp-in-admin` etc.):
 
 - `mgr.GetCertificateInfo(domain)` / `mgr.CheckCertificates()` — expiry status.
 - `mgr.RenewCertificate(domain)` — manual renewal (leader-only; bypasses the
-  DANE issuance gate with a warning).
+  DANE issuance gate with a warning). It **always places a new order**, even
+  for a certificate nowhere near its renewal window — that is its purpose, the
+  maintenance loop covers the scheduled case — so each call spends one of Let's
+  Encrypt's five duplicate certificates per week. It errors rather than answer
+  with the existing certificate when a peer holds the issuance lease.
 - `mgr.DesiredTLSARecords(ctx)` — zone lines the operator must publish.
 - Key-replacement ceremony (leader-only):
   1. `mgr.ReplaceCertificateKey(domain)` → publish returned TLSA records

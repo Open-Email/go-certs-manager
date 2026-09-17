@@ -122,7 +122,7 @@ func TestIssueWithKeyRespectsRetryBudget(t *testing.T) {
 	}
 	m.retries.recordFailure("mx.example.com")
 
-	if _, err := m.issueWithKey(ctx, "mx.example.com", key); err == nil ||
+	if _, err := m.issueWithKey(ctx, "mx.example.com", key, false); err == nil ||
 		!strings.Contains(err.Error(), "retry budget exhausted") {
 		t.Fatalf("expected retry-budget error, got %v", err)
 	}

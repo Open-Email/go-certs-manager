@@ -22,6 +22,13 @@ const (
 	letsEncryptStagingURL = "https://acme-staging-v02.api.letsencrypt.org/directory"
 )
 
+// orderer is the one call the Manager makes on the CA: a chain for domain, bound
+// to certKey. *Issuer is the only production implementation; the seam exists so
+// a test can count orders and hand back a chain without a CA behind it.
+type orderer interface {
+	Issue(ctx context.Context, domain string, certKey crypto.Signer) ([]byte, error)
+}
+
 // Issuer drives RFC 8555 certificate issuance directly via x/crypto/acme,
 // building the CSR from a caller-owned key so the issued leaf binds to a stable
 // SubjectPublicKeyInfo. It is the replacement for autocert's hidden issuance, and

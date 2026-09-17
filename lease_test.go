@@ -138,7 +138,7 @@ func TestIssueWithKey_DefersToStorageWhenLeaseHeld(t *testing.T) {
 
 	// issueWithKey would call the CA if it tried to issue (no CA here) — it must
 	// instead defer and return the stored cert.
-	cert, err := m.issueWithKey(ctx, "mx.example.com", key)
+	cert, err := m.issueWithKey(ctx, "mx.example.com", key, false)
 	if err != nil {
 		t.Fatalf("expected defer-to-storage, got error: %v", err)
 	}

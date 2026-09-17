@@ -274,7 +274,7 @@ func (m *Manager) renewIfNeeded(ctx context.Context, domain string) error {
 	if err != nil {
 		return err
 	}
-	if _, err := m.issueWithKey(ctx, domain, certKey); err != nil {
+	if _, err := m.issueWithKey(ctx, domain, certKey, false); err != nil {
 		return err
 	}
 	if have {

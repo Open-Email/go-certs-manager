@@ -74,7 +74,7 @@ type DANEConfig struct {
 // SPKI (and its DANE digest) never changes.
 type Manager struct {
 	keyStore   *KeyStore
-	issuer     *Issuer
+	issuer     orderer
 	certCache  *certCache
 	challenges *ChallengeServer
 	dane       *daneController
@@ -264,7 +264,7 @@ func (m *Manager) refreshAllowSetIfConfigured(ctx context.Context) {
 
 // ensureIssuer lazily builds the ACME issuer (and registers the account) the first
 // time the leader needs to issue. Followers never call this.
-func (m *Manager) ensureIssuer(ctx context.Context) (*Issuer, error) {
+func (m *Manager) ensureIssuer(ctx context.Context) (orderer, error) {
 	m.issuerMu.Lock()
 	defer m.issuerMu.Unlock()
 	if m.issuer != nil {
@@ -522,7 +522,7 @@ func (m *Manager) obtain(ctx context.Context, domain string) (*tls.Certificate, 
 	if err != nil {
 		return nil, err
 	}
-	return m.issueWithKey(ctx, domain, certKey)
+	return m.issueWithKey(ctx, domain, certKey, false)
 }
 
 // issueWithKey runs the ACME flow for domain with the given key and stores the
@@ -530,7 +530,14 @@ func (m *Manager) obtain(ctx context.Context, domain string) (*tls.Certificate, 
 // believed-leaders can't drive duplicate orders. Attempts are additionally
 // capped by the per-domain retry budget so a persistent failure (firewall, DNS)
 // can't burn through the CA's failed-validation rate limit.
-func (m *Manager) issueWithKey(ctx context.Context, domain string, certKey crypto.Signer) (*tls.Certificate, error) {
+//
+// force is the operator's manual renewal: it orders even though storage holds a
+// certificate outside the renewal window, because replacing a still-valid
+// certificate (mis-issuance, a CA-requested replacement) is exactly what the
+// command exists for. It skips only that freshness check — the lease and the
+// retry budget still apply, so a forced order is serialized and bounded like
+// any other.
+func (m *Manager) issueWithKey(ctx context.Context, domain string, certKey crypto.Signer, force bool) (*tls.Certificate, error) {
 	if wait, ok := m.retries.allow(domain); !ok {
 		return nil, fmt.Errorf("issuance retry budget exhausted for %s (max %d failed attempts per hour, protecting CA rate limits); next attempt allowed in %s",
 			domain, m.retries.max, wait.Round(time.Second))
@@ -541,7 +548,10 @@ func (m *Manager) issueWithKey(ctx context.Context, domain string, certKey crypt
 		// Another node holds the issuance lease. Don't drive a duplicate ACME order;
 		// serve the peer's result from storage if it's there yet.
 		m.logger.Info("TLS: issuance deferred — lease held by another node", "domain", domain)
-		if cert, err := m.certCache.Refresh(ctx, domain); err == nil {
+		// Not under force: the peer's certificate answers "is there one to serve",
+		// but the operator asked for a NEW order, and handing back the stored
+		// certificate would report a renewal that never happened.
+		if cert, err := m.certCache.Refresh(ctx, domain); err == nil && !force {
 			return cert, nil
 		}
 		return nil, fmt.Errorf("issuance in progress on another node for %s", domain)
@@ -550,7 +560,9 @@ func (m *Manager) issueWithKey(ctx context.Context, domain string, certKey crypt
 
 	// Re-check storage now that we hold the lease: a peer that just released it may
 	// already have produced a still-fresh certificate, so we must not re-issue.
-	if cert, err := m.certCache.Refresh(ctx, domain); err == nil {
+	// Refresh runs under force too (it adopts whatever a peer stored); only the
+	// decision to stop there is skipped.
+	if cert, err := m.certCache.Refresh(ctx, domain); err == nil && !force {
 		if na, ok := m.certCache.leafNotAfter(domain); ok && time.Until(na) > m.renewBefore {
 			m.logger.Debug("TLS: skipping issuance — peer already produced a fresh cert", "domain", domain)
 			return cert, nil
@@ -676,6 +688,12 @@ func (m *Manager) CheckCertificates() {
 
 // RenewCertificate re-issues a domain's certificate reusing its persistent key, so
 // the SPKI (and any DANE TLSA record) is unchanged. Must run on the leader.
+//
+// It ALWAYS drives a new order, however fresh the current certificate is: the
+// maintenance loop already renews on schedule, so the only reason to call this
+// is to replace a certificate that is still valid. Each call spends one of the
+// CA's duplicate-certificate allowance (Let's Encrypt: 5 per identifier set per
+// week), which is the caller's to budget.
 func (m *Manager) RenewCertificate(domain string) ([]string, error) {
 	if m == nil {
 		return nil, fmt.Errorf("TLS manager not initialized")
@@ -702,7 +720,7 @@ func (m *Manager) RenewCertificate(domain string) ([]string, error) {
 	if err != nil {
 		return nil, err
 	}
-	if _, err := m.issueWithKey(ctx, domain, certKey); err != nil {
+	if _, err := m.issueWithKey(ctx, domain, certKey, true); err != nil {
 		return nil, fmt.Errorf("renew %s: %w", domain, err)
 	}
 	m.logger.Info("certificate renewed (key reused — SPKI unchanged)", "domain", domain)
