@@ -225,11 +225,21 @@ For admin CLIs (`smtp-in-admin` etc.):
   accepts it.
 
   Don't classify it yourself — use `adminapi`, so every service draws the line
-  the same way. On the server, `adminapi.WriteRenewResult(w, domain, renewed,
-  err)` answers 200 / 202 `"stored"` / 500. In the CLI, print
-  `adminapi.RenewPreamble(domain)` BEFORE the request (the call always spends an
-  order), then exit with the code `adminapi.RenewOutcome(status, body)` returns:
-  `0` ordered and stored, `2` ordered but not stored — never retry, `1` failed.
+  the same way:
+
+  - **Server:** mount `adminapi.RenewHandler(func() adminapi.Renewer { ... },
+    logger)` behind your admin auth. It extends the write deadline to
+    `adminapi.RenewTimeout`, because a renewal is a whole ACME order and your
+    server's `WriteTimeout` is sized in seconds — cut off, the client learns
+    nothing about an order that went ahead. The func may return nil until the
+    manager exists; the endpoint answers 501 until it does.
+  - **CLI:** print `adminapi.RenewPreamble(domain)` BEFORE the request (it
+    always spends an order), give the HTTP client at least
+    `adminapi.RenewTimeout`, and exit with the code from
+    `adminapi.RenewOutcome(status, body)` — or from
+    `adminapi.RenewTransportFailure(err)` if no answer came back, which is
+    outcome-unknown and never retryable. `0` ordered and stored, `2` spent or
+    unknown — do not re-run, `1` failed.
 - `mgr.DesiredTLSARecords(ctx)` — zone lines the operator must publish. It now
   returns an **error** rather than an incomplete set when the retiring markers
   cannot be read: answering without them would name a set that omits digests

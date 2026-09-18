@@ -14,8 +14,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"log/slog"
 	"net/http"
 	"strings"
+	"time"
 
 	certmanager "github.com/Open-Email/go-certs-manager"
 )
@@ -26,6 +29,22 @@ const (
 	StatusStored  = "stored"  // ordered, NOT stored — the order is spent
 	StatusError   = "error"   // nothing was ordered, or the order failed
 )
+
+// RenewTimeout is how long both ends of a renewal must be prepared to wait.
+//
+// A renewal is a whole ACME order run synchronously, and it may first queue
+// behind a maintenance issuance holding the same domain — two issuance windows
+// back to back, plus margin. The services' default HTTP timeouts are seconds:
+// a client that gives up at ten reports a failure while the order carries on,
+// and the operator retries into a second one. RenewHandler extends the
+// server's write deadline to this, and a CLI must give its client at least as
+// long.
+//
+// Waiting longer still cannot be unsafe, because a request that gets no
+// answer is reported as outcome-unknown, not as a failure (see
+// RenewTransportFailure). The timeout decides only whether the operator gets a
+// definite answer.
+const RenewTimeout = 2*certmanager.IssueTimeout + time.Minute
 
 // Exit codes the admin CLI returns. They are an interface with automation: an
 // ansible `command` task retries on any non-zero rc, so the one outcome that
@@ -77,6 +96,86 @@ func WriteRenewResult(w http.ResponseWriter, domain string, renewed []string, er
 
 func writeJSON(w http.ResponseWriter, r Result) {
 	_ = json.NewEncoder(w).Encode(r)
+}
+
+// Renewer is what RenewHandler drives — certmanager.Manager satisfies it.
+type Renewer interface {
+	RenewCertificate(domain string) ([]string, error)
+}
+
+// RenewHandler serves a renewal request: POST, with the domain in the query
+// string (?domain=) or a JSON body ({"domain": ...}).
+//
+// renewer is called per request, so a service can mount this before its
+// certificate manager exists and have it answer 501 until it does. Every
+// service mounting the same handler is the point: the request shape, the
+// deadline and the classification cannot drift between them.
+func RenewHandler(renewer func() Renewer, logger *slog.Logger) http.Handler {
+	if logger == nil {
+		logger = slog.Default()
+	}
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		var mgr Renewer
+		if renewer != nil {
+			mgr = renewer()
+		}
+		if mgr == nil {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusNotImplemented)
+			writeJSON(w, Result{Status: StatusError, Error: "certificate renewal not configured (no Let's Encrypt manager on this node)"})
+			return
+		}
+
+		domain := r.URL.Query().Get("domain")
+		if domain == "" && r.Body != nil {
+			var body struct {
+				Domain string `json:"domain"`
+			}
+			_ = json.NewDecoder(io.LimitReader(r.Body, 1024)).Decode(&body)
+			domain = body.Domain
+		}
+		if domain == "" {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusBadRequest)
+			writeJSON(w, Result{Status: StatusError, Error: "domain parameter is required"})
+			return
+		}
+
+		// The service's own WriteTimeout is sized for requests that take
+		// milliseconds. Left alone it cuts this response off mid-order, and the
+		// client learns nothing about an order that went ahead anyway. The
+		// renewal itself runs on its own context, so a client that disconnects
+		// does not abandon an order the CA is already working on.
+		if err := http.NewResponseController(w).SetWriteDeadline(time.Now().Add(RenewTimeout)); err != nil {
+			logger.Debug("TLS: could not extend the write deadline for a renewal", "error", err)
+		}
+
+		logger.Info("Certificate renewal requested", "domain", domain)
+		renewed, err := mgr.RenewCertificate(domain)
+		if err != nil {
+			logger.Error("Certificate renewal failed", "domain", domain, "error", err)
+		}
+		WriteRenewResult(w, domain, renewed, err)
+	})
+}
+
+// RenewTransportFailure is the outcome when the request got no answer.
+//
+// That is NOT a failure a CLI may call retryable. The request may have reached
+// the service and the order may be under way — a client that timed out has no
+// way to know — so the only safe instruction is the spent-order one: do not
+// re-run, look first. It shares the "stored" exit code for the same reason.
+func RenewTransportFailure(err error) ([]string, int) {
+	return []string{
+		"⚠ No answer from the service — the outcome is unknown",
+		"  " + err.Error(),
+		"  The order may have gone ahead. DO NOT re-run this until the",
+		"  certificate listing shows it did not: re-running spends another.",
+	}, ExitStored
 }
 
 // RenewPreamble is what the CLI prints BEFORE the request. Before, not after:

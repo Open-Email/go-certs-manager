@@ -196,3 +196,8 @@ func pickChallenge(challenges []*acme.Challenge) *acme.Challenge {
 
 // issueTimeout bounds a single issuance attempt (challenge + finalize).
 const issueTimeout = 2 * time.Minute
+
+// IssueTimeout is issueTimeout, exported so callers that wait on an issuance —
+// an admin client above all — can size their own deadlines from it rather than
+// guess, and keep up when it changes.
+const IssueTimeout = issueTimeout
