@@ -222,9 +222,14 @@ For admin CLIs (`smtp-in-admin` etc.):
   caller must **not** retry: the CA issued the certificate — the order is spent
   — but storage would not take it. The certificate is in memory and being
   served, and every maintenance tick re-attempts the write until storage
-  accepts it. Surface it to the operator as its own outcome (a distinct exit
-  code, not the generic failure) so automation does not re-run the command and
-  spend a second order for a certificate the node already holds.
+  accepts it.
+
+  Don't classify it yourself — use `adminapi`, so every service draws the line
+  the same way. On the server, `adminapi.WriteRenewResult(w, domain, renewed,
+  err)` answers 200 / 202 `"stored"` / 500. In the CLI, print
+  `adminapi.RenewPreamble(domain)` BEFORE the request (the call always spends an
+  order), then exit with the code `adminapi.RenewOutcome(status, body)` returns:
+  `0` ordered and stored, `2` ordered but not stored — never retry, `1` failed.
 - `mgr.DesiredTLSARecords(ctx)` — zone lines the operator must publish. It now
   returns an **error** rather than an incomplete set when the retiring markers
   cannot be read: answering without them would name a set that omits digests
