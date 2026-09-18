@@ -746,3 +746,117 @@ func TestRecordIssued_SaysWhenItCannotPublish(t *testing.T) {
 		t.Error("a failed index publication was silent; nothing tells an operator followers are not being told")
 	}
 }
+
+// The end of the road for a chain stored by a node that could not announce it.
+//
+// No duplicate ORDER was ever at risk — renewIfNeeded reads storage before it
+// issues — but the hostname is classified a first issuance, so it takes a token
+// from the hourly new-order budget and then turns out not to need one. Under
+// pressure (an import, or a backlog of unannounced chains after an outage) those
+// phantoms starve the hostnames that genuinely have nothing.
+//
+// One token, and only one, for the one hostname that really is new.
+func TestOnDemandIssuance_AStoredChainDoesNotSpendANewOrderToken(t *testing.T) {
+	fs, err := storage.NewFilesystemBackend(t.TempDir(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	ca := &countingCA{}
+
+	m := newOnDemandManager(t, fs, true, OnDemandConfig{
+		MaxConcurrentOrders: 1, // serial, so the budget is spent in host order
+		MaxNewOrdersPerHour: 1, // exactly one token to fight over
+	})
+	m.issuer = ca
+	m.renewBefore = 30 * 24 * time.Hour
+	m.retries = newRetryBudget(3)
+	// Sorted, so the phantom is offered the token first.
+	m.onDemand.store([]string{"a-stored.example.com", "b-new.example.com"})
+
+	// What an ex-leader's flush leaves behind: the chain in storage, and an
+	// index that says nothing about it.
+	ks := NewKeyStore(fs, "", KeyTypeECDSAP256, func() bool { return true }, nil)
+	key, err := ks.LoadOrCreateCertKey(ctx, "a-stored.example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	chain, err := chainWithSerial(key, "a-stored.example.com", 55)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := m.certCache.persist(ctx, "a-stored.example.com", chain, 1); err != nil {
+		t.Fatal(err)
+	}
+	if _, known := m.onDemand.indexNotAfter("a-stored.example.com"); known {
+		t.Fatal("setup: the index should not know the stored hostname")
+	}
+
+	m.maintainOnDemand(true)
+
+	if ca.orders != 1 {
+		t.Fatalf("CA saw %d order(s), want exactly 1 — the genuinely new hostname", ca.orders)
+	}
+	if _, ok := m.certCache.Get("b-new.example.com"); !ok {
+		t.Error("the genuinely new hostname got no certificate; the phantom took the only token")
+	}
+	served, ok := m.certCache.Get("a-stored.example.com")
+	if !ok || served.Leaf.SerialNumber.Int64() != 55 {
+		t.Fatalf("the stored certificate was not adopted (ok=%v)", ok)
+	}
+	// Repaired, which is what finally tells the followers it exists.
+	if _, known := m.onDemand.indexNotAfter("a-stored.example.com"); !known {
+		t.Error("the index was not repaired, so followers still will not refresh the hostname")
+	}
+}
+
+// The safety net must not swallow a genuine first issuance: a hostname with
+// nothing in storage still gets ordered, and still pays for its token.
+func TestOnDemandIssuance_StillOrdersWhenStorageReallyHasNothing(t *testing.T) {
+	fs, err := storage.NewFilesystemBackend(t.TempDir(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ca := &countingCA{}
+
+	m := newOnDemandManager(t, fs, true, OnDemandConfig{MaxConcurrentOrders: 2})
+	m.issuer = ca
+	m.renewBefore = 30 * 24 * time.Hour
+	m.retries = newRetryBudget(3)
+	m.onDemand.store([]string{"fresh.example.com"})
+
+	m.maintainOnDemand(true)
+
+	if ca.orders != 1 {
+		t.Fatalf("CA saw %d order(s) for a hostname with nothing in storage, want 1", ca.orders)
+	}
+	if _, ok := m.certCache.Get("fresh.example.com"); !ok {
+		t.Error("the ordered certificate is not being served")
+	}
+}
+
+// The new-order budget must still bite. It is what keeps an import of many
+// hostnames from walking into the CA's account-level limits in one tick, so
+// the adopt-before-ordering shortcut must not become a way around it.
+func TestOnDemandIssuance_NewOrderBudgetStillCapsFirstIssuances(t *testing.T) {
+	fs, err := storage.NewFilesystemBackend(t.TempDir(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ca := &countingCA{}
+
+	m := newOnDemandManager(t, fs, true, OnDemandConfig{
+		MaxConcurrentOrders: 1,
+		MaxNewOrdersPerHour: 1,
+	})
+	m.issuer = ca
+	m.renewBefore = 30 * 24 * time.Hour
+	m.retries = newRetryBudget(3)
+	m.onDemand.store([]string{"one.example.com", "two.example.com", "three.example.com"})
+
+	m.maintainOnDemand(true)
+
+	if ca.orders != 1 {
+		t.Fatalf("CA saw %d order(s) for three new hostnames on a budget of 1, want 1", ca.orders)
+	}
+}

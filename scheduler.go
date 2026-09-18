@@ -195,6 +195,24 @@ func (m *Manager) maintainOnDemand(leader bool) {
 			m.logger.Debug("TLS: on-demand issue/renew skipped — DNS pre-flight", "domain", host, "renewal", isRenewal, "reason", reason)
 			return
 		}
+		// Last look before spending money. This hostname was classified as a
+		// FIRST issuance because neither memory nor the index mentioned it —
+		// but the index records what a leader announced, not what storage
+		// holds, and the two come apart: a chain flushed by a node that had
+		// lost leadership cannot be announced at all, and an index write can
+		// simply fail. Either way the certificate is sitting in storage and
+		// the index does not say so, and the old cost of being wrong here was
+		// a duplicate order for a certificate we already owned.
+		//
+		// One GET, bounded by the new-order budget below, against one order.
+		// Adopting also republishes the index through the tail of this
+		// function, which is what finally tells the followers it exists.
+		if !isRenewal {
+			if _, err := m.certCache.Refresh(ctx, host); err == nil {
+				m.logger.Info("TLS: storage already held a certificate the index did not mention — adopting it instead of ordering", "domain", host)
+				isRenewal = true
+			}
+		}
 		// The new-order budget stays first-issuance only: renewals are bounded
 		// by certificate lifetime and must never be starved by an import.
 		if !isRenewal && !m.onDemand.orders.take() {
