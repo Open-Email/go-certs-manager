@@ -2,7 +2,9 @@ package certmanager
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -15,6 +17,12 @@ import (
 //   - on the leader: issue missing certs and renew certs within the renewal window
 //     (always reusing the persistent key, so the SPKI never changes)
 //   - on followers: refresh certs from storage so they serve what the leader issued
+//
+// flushTimeout bounds one pass over the held chains. Generous enough for a
+// sizeable backlog at one write each, short enough that it cannot become the
+// tick.
+const flushTimeout = 2 * time.Minute
+
 func (m *Manager) startMaintenance() {
 	safego.Go(m.logger, "tls-maintenance", func() {
 		defer close(m.doneCh)
@@ -36,15 +44,20 @@ func (m *Manager) startMaintenance() {
 }
 
 func (m *Manager) maintainOnce() {
+	leader := m.isLeader()
+
+	// Held chains first, on their OWN budget. Sharing the tick's context would
+	// let a storage outage — the only way chains pile up — eat the deadline that
+	// the renewals and the follower refresh below depend on.
+	flushCtx, cancelFlush := context.WithTimeout(context.Background(), flushTimeout)
+	stored := m.flushHeldChains(flushCtx)
+	cancelFlush()
+
 	ctx, cancel := context.WithTimeout(context.Background(), issueTimeout+30*time.Second)
 	defer cancel()
 
-	// Before anything else: a chain the CA issued that storage would not take is
-	// still unwritten, and every tick it stays that way is a tick in which only
-	// this node's memory holds it.
-	m.certCache.flushPending(ctx)
+	m.announceStoredChains(ctx, leader, stored)
 
-	leader := m.isLeader()
 	for _, domain := range m.domains {
 		if leader {
 			m.reconcileCeremony(ctx, domain)
@@ -205,6 +218,106 @@ func (m *Manager) maintainOnDemand(leader bool) {
 		}
 	}
 	wg.Wait()
+}
+
+// announceStoredChains publishes a late write to the on-demand index.
+//
+// An on-demand hostname reaches followers only through that index: they refresh
+// what changedSince reports and nothing else. The leader will not revisit the
+// hostname either — memory already holds a fresh certificate for it, so neither
+// the classifier nor the handshake path will touch it again — so without this
+// the chain sits in storage that no follower is ever told to read, until it
+// expires. Static domains need none of it: followers re-read them every tick.
+func (m *Manager) announceStoredChains(ctx context.Context, leader bool, stored []string) {
+	if !leader || m.onDemand == nil {
+		return
+	}
+	for _, domain := range stored {
+		if m.domainSet[domain] {
+			continue
+		}
+		if notAfter, ok := m.certCache.leafNotAfter(domain); ok {
+			m.onDemand.noteIssued(ctx, domain, notAfter)
+		}
+	}
+}
+
+// flushHeldChains writes the chains an earlier issuance could not persist, and
+// returns the domains it managed to store.
+//
+// Every guard here exists because this writes a shared object for a domain this
+// node may no longer be responsible for:
+//
+//   - the per-domain inflight lock, so a handshake-driven issuance in this
+//     process cannot land between the read below and the write;
+//   - the issuance lease, so a peer flushing or issuing the same domain cannot
+//     either — two nodes each holding a chain would otherwise race, and the
+//     older one could land last;
+//   - a read that must SUCCEED before writing. Storage holding something at
+//     least as new means our copy is spent history, and a read that merely
+//     failed proves nothing — treating "I could not look" as "nothing is
+//     there" is how an older chain lands on top of a newer one.
+//
+// One attempt per domain per tick; the tick is the retry.
+func (m *Manager) flushHeldChains(ctx context.Context) []string {
+	held := m.certCache.pendingSnapshot()
+	if len(held) == 0 {
+		return nil
+	}
+
+	var stored []string
+	for domain, p := range held {
+		if ctx.Err() != nil {
+			break
+		}
+		if m.flushOne(ctx, domain, p) {
+			stored = append(stored, domain)
+		}
+	}
+	return stored
+}
+
+// flushOne is one domain's flush, split out so the lock and lease releases are
+// plain defers rather than a hand-unwound loop body.
+func (m *Manager) flushOne(ctx context.Context, domain string, p pendingPersist) bool {
+	unlock := m.inflight.lock(domain)
+	defer unlock()
+
+	release, ok := m.acquireIssueLease(ctx, domain)
+	if !ok {
+		m.logger.Debug("TLS: not flushing a held chain — another node holds the lease", "domain", domain)
+		return false
+	}
+	defer release()
+
+	switch notAfter, err := m.certCache.storedNotAfter(ctx, domain); {
+	case err == nil && !notAfter.Before(p.notAfter):
+		// Storage moved on without us. Drop what we hold AND take what is there:
+		// leaving the older chain in memory would keep this node serving a
+		// superseded SPKI, which after a peer's key replacement is a DANE
+		// mismatch rather than merely a stale certificate.
+		m.logger.Info("TLS: storage holds a chain at least as new — dropping the held copy", "domain", domain)
+		if _, err := m.certCache.Refresh(ctx, domain); err != nil {
+			m.logger.Warn("TLS: could not adopt the stored chain after dropping the held one", "domain", domain, "error", err)
+		}
+		m.certCache.dropPending(domain)
+		return false
+	case err == nil:
+		// Storage is behind ours — write.
+	case errors.Is(err, os.ErrNotExist):
+		// Storage has nothing — write.
+	default:
+		m.logger.Warn("TLS: cannot check what storage holds — leaving the held chain alone", "domain", domain, "error", err)
+		return false
+	}
+
+	if err := m.certCache.persist(ctx, domain, p.chainPEM, 1); err != nil {
+		m.logger.Warn("TLS: still cannot store the issued chain — it stays in memory only", "domain", domain, "error", err)
+		return false
+	}
+	m.logger.Info("TLS: stored a chain that had been held in memory since issuance", "domain", domain)
+	m.certCache.dropPending(domain)
+	return true
 }
 
 // reconcileCeremony completes a key-replacement ceremony that was interrupted
@@ -402,7 +515,9 @@ func (m *Manager) ActivateCertificateKey(domain string, force bool) error {
 	}
 	// Serve the new cert (bound to the next key) before promoting, so storage and
 	// the live key converge; PromoteNextCertKey then makes keyFor match the chain.
-	if _, err := m.certCache.Store(ctx, domain, chainPEM, nextKey); err != nil {
+	cert, err := m.certCache.Store(ctx, domain, chainPEM, nextKey)
+	heldNotStored := err != nil && cert != nil && errors.Is(err, errPersistFailed)
+	if err != nil && !heldNotStored {
 		return fmt.Errorf("store cert for %s: %w", domain, err)
 	}
 	// Record the OUTGOING (still-live) digest for the DANE soak window BEFORE
@@ -412,6 +527,16 @@ func (m *Manager) ActivateCertificateKey(domain string, force bool) error {
 		if err := m.dane.markRetiring(ctx, domain); err != nil {
 			m.logger.Warn("TLS: failed to record retiring DANE digest", "domain", domain, "error", err)
 		}
+	}
+	if heldNotStored {
+		// The ceremony's order is as spent as any other, so hold the chain
+		// rather than lose it. The key stays STAGED: promoting against a chain
+		// storage does not have would leave every follower unable to pair them.
+		// Once the flush lands the chain, reconcileCeremony promotes — the same
+		// roll-forward that covers a leader crashing between Store and Promote.
+		m.certCache.hold(domain, cert, chainPEM)
+		return fmt.Errorf("%w for %s: the replacement key stays staged and the ceremony completes once storage accepts the chain: %v",
+			ErrOrderNotPersisted, domain, err)
 	}
 	// Re-check leadership immediately before the destructive promote: if this node
 	// flapped during issuance, abort rather than overwrite the live key. The stored

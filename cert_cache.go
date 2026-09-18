@@ -107,7 +107,7 @@ func (c *certCache) Store(ctx context.Context, domain string, chainPEM []byte, k
 	if err != nil {
 		return nil, err
 	}
-	if err := c.persist(ctx, domain, chainPEM); err != nil {
+	if err := c.persist(ctx, domain, chainPEM, persistAttempts); err != nil {
 		return cert, err
 	}
 	c.set(domain, cert)
@@ -115,10 +115,14 @@ func (c *certCache) Store(ctx context.Context, domain string, chainPEM []byte, k
 	return cert, nil
 }
 
-// persist writes the chain, retrying a transient failure a few times. Returns an
-// error wrapping errPersistFailed so Store's caller can tell a storage problem
-// from an unusable chain.
-func (c *certCache) persist(ctx context.Context, domain string, chainPEM []byte) error {
+// persist writes the chain, retrying a transient failure up to attempts times.
+// Returns an error wrapping errPersistFailed so Store's caller can tell a
+// storage problem from an unusable chain.
+//
+// attempts is 1 from the maintenance tick, which is itself the retry: sleeping
+// through a backoff there would spend the tick's budget on a domain whose next
+// chance is minutes away anyway, and starve the renewals queued behind it.
+func (c *certCache) persist(ctx context.Context, domain string, chainPEM []byte, attempts int) error {
 	var err error
 	for attempt := 1; ; attempt++ {
 		data := string(chainPEM)
@@ -128,7 +132,7 @@ func (c *certCache) persist(ctx context.Context, domain string, chainPEM []byte)
 		if err == nil {
 			return nil
 		}
-		if attempt >= persistAttempts {
+		if attempt >= attempts {
 			break
 		}
 		c.logger.Warn("TLS: storing the chain failed — retrying", "domain", domain, "attempt", attempt, "error", err)
@@ -173,37 +177,27 @@ func (c *certCache) pendingDomains() []string {
 	return out
 }
 
-// flushPending retries the writes that failed, and is called on every
-// maintenance tick.
-//
-// It never overwrites a chain that is at least as new as the one it holds. A
-// node holding a pending write may have lost leadership in the meantime, and
-// the new leader's renewal is in storage; putting our older copy back on top of
-// it is how a fleet talks itself onto an expiring certificate. When storage has
-// caught up or moved ahead, the held copy is simply dropped.
-func (c *certCache) flushPending(ctx context.Context) {
+// pendingSnapshot copies the held chains so the caller can work through them
+// without holding the lock across storage calls.
+func (c *certCache) pendingSnapshot() map[string]pendingPersist {
 	c.pendingMu.Lock()
-	snapshot := make(map[string]pendingPersist, len(c.pending))
+	defer c.pendingMu.Unlock()
+	out := make(map[string]pendingPersist, len(c.pending))
 	for d, p := range c.pending {
-		snapshot[d] = p
+		out[d] = p
 	}
-	c.pendingMu.Unlock()
+	return out
+}
 
-	for domain, p := range snapshot {
-		if stored, err := c.loadChain(ctx, domain); err == nil {
-			if na, err := leafNotAfterPEM(stored); err == nil && !na.Before(p.notAfter) {
-				c.logger.Info("TLS: storage already holds a chain at least as new — dropping the held copy", "domain", domain)
-				c.dropPending(domain)
-				continue
-			}
-		}
-		if err := c.persist(ctx, domain, p.chainPEM); err != nil {
-			c.logger.Warn("TLS: still cannot store the issued chain — it stays in memory only", "domain", domain, "error", err)
-			continue
-		}
-		c.logger.Info("TLS: stored a chain that had been held in memory since issuance", "domain", domain)
-		c.dropPending(domain)
+// storedNotAfter reports the expiry of the leaf currently in storage for a
+// domain. A missing object returns an error satisfying os.ErrNotExist, which is
+// the caller's signal that writing is safe.
+func (c *certCache) storedNotAfter(ctx context.Context, domain string) (time.Time, error) {
+	chainPEM, err := c.loadChain(ctx, domain)
+	if err != nil {
+		return time.Time{}, err
 	}
+	return leafNotAfterPEM(chainPEM)
 }
 
 // leafNotAfterPEM reads the expiry of the first leaf in a PEM chain.
