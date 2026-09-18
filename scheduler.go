@@ -205,9 +205,7 @@ func (m *Manager) maintainOnDemand(leader bool) {
 			m.logger.Warn("TLS: on-demand issue/renew failed", "domain", host, "renewal", isRenewal, "error", err)
 			return
 		}
-		if notAfter, ok := m.certCache.leafNotAfter(host); ok {
-			m.onDemand.noteIssued(ctx, host, notAfter)
-		}
+		m.recordIssued(ctx, host)
 	}
 	for _, group := range []struct {
 		hosts     []string
@@ -239,17 +237,28 @@ func (m *Manager) announceStoredChains(ctx context.Context, leader bool, stored 
 		if m.domainSet[domain] {
 			continue
 		}
-		notAfter, ok := m.certCache.leafNotAfter(domain)
-		if !ok {
-			continue
-		}
-		if err := m.onDemand.noteIssued(ctx, domain, notAfter); err != nil {
-			// Not fatal and not retried here: the entry is in the in-memory
-			// index, so the next hostname this leader publishes carries it. On a
-			// fleet with no other on-demand churn it waits for that.
-			m.logger.Warn("TLS: stored a chain but could not publish the on-demand index — followers will not refresh it yet",
-				"domain", domain, "error", err)
-		}
+		m.recordIssued(ctx, domain)
+	}
+}
+
+// recordIssued publishes a hostname's expiry to the shared on-demand index.
+//
+// One function for both callers — the issuance path and the late flush —
+// because the interesting part is the failure, and it went unmentioned on one
+// of them for exactly as long as they were separate. Not retried here: the
+// entry is in the in-memory index, so the next hostname this leader publishes
+// carries it along. On a fleet with no other on-demand churn, it waits for one.
+func (m *Manager) recordIssued(ctx context.Context, host string) {
+	if m.onDemand == nil {
+		return
+	}
+	notAfter, ok := m.certCache.leafNotAfter(host)
+	if !ok {
+		return
+	}
+	if err := m.onDemand.noteIssued(ctx, host, notAfter); err != nil {
+		m.logger.Warn("TLS: could not publish the on-demand index — followers will not refresh this hostname yet",
+			"domain", host, "error", err)
 	}
 }
 

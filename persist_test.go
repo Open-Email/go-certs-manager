@@ -13,6 +13,7 @@ import (
 	"io"
 	"log/slog"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -687,5 +688,61 @@ func TestNoteIssued_ReportsAFailedPublication(t *testing.T) {
 	// Recorded in memory all the same, so the next publication carries it.
 	if _, known := od.indexNotAfter("vanity.example.com"); !known {
 		t.Error("the entry was dropped from the in-memory index, so nothing will republish it")
+	}
+}
+
+// capturingHandler collects log records so a test can assert that a failure
+// was actually reported — the whole point of the error return.
+type capturingHandler struct {
+	slog.Handler
+	mu      sync.Mutex
+	records []slog.Record
+}
+
+func (h *capturingHandler) Enabled(context.Context, slog.Level) bool { return true }
+
+func (h *capturingHandler) Handle(_ context.Context, r slog.Record) error {
+	h.mu.Lock()
+	h.records = append(h.records, r)
+	h.mu.Unlock()
+	return nil
+}
+
+func (h *capturingHandler) warnedAbout(substr string) bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	for _, r := range h.records {
+		if r.Level >= slog.LevelWarn && strings.Contains(r.Message, substr) {
+			return true
+		}
+	}
+	return false
+}
+
+// A failed index publication must be said out loud on EVERY path that
+// publishes. It was silent on the issuance path while the flush path warned,
+// which is the drift a shared helper removes.
+func TestRecordIssued_SaysWhenItCannotPublish(t *testing.T) {
+	fs, err := storage.NewFilesystemBackend(t.TempDir(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	backend := &flakyBackend{Backend: fs, failFor: certIndexKey, failPuts: 1}
+	handler := &capturingHandler{Handler: slog.NewTextHandler(io.Discard, nil)}
+
+	ks := NewKeyStore(backend, "", KeyTypeECDSAP256, func() bool { return true }, nil)
+	m := &Manager{
+		keyStore:  ks,
+		certCache: newCertCache(backend, "", ks.LoadCertKey, nil),
+		logger:    slog.New(handler),
+		domainSet: map[string]bool{},
+	}
+	m.onDemand = newOnDemand(OnDemandConfig{}, backend, "")
+	holdChain(t, m, "vanity.example.com", 41)
+
+	m.recordIssued(context.Background(), "vanity.example.com")
+
+	if !handler.warnedAbout("could not publish the on-demand index") {
+		t.Error("a failed index publication was silent; nothing tells an operator followers are not being told")
 	}
 }
