@@ -302,8 +302,15 @@ func (d *daneController) verifyPublished(ctx context.Context) map[string]bool {
 	status := make(map[string]bool, len(d.mxHosts))
 	for _, host := range d.mxHosts {
 		desired, err := d.recordsForHost(ctx, host)
-		if err != nil || len(desired) == 0 {
-			continue // no key yet (or transient storage error) — nothing to verify
+		if err != nil {
+			// Not folded into the "nothing to verify" case below: a storage
+			// problem that silences the drift alarm must not look like a host
+			// that has no key yet.
+			d.logger.Warn("TLS: DANE — drift check skipped, desired records unavailable", "host", host, "error", err)
+			continue
+		}
+		if len(desired) == 0 {
+			continue // no key yet — nothing to verify
 		}
 		published, err := d.lookup(ctx, host)
 		if err != nil {

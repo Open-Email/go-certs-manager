@@ -230,8 +230,10 @@ func (b *readErrorBackend) GetObject(ctx context.Context, key string) (io.ReadCl
 	return b.Backend.GetObject(ctx, key)
 }
 
+// Counts writes to the very thing it will not let you read, so a test can say
+// "it wrote without knowing what was there".
 func (b *readErrorBackend) PutObject(ctx context.Context, key string, r io.Reader, size int64, opts storage.PutOptions) error {
-	if strings.Contains(key, "certs/") {
+	if strings.Contains(key, b.failGetFor) {
 		b.puts++
 	}
 	return b.Backend.PutObject(ctx, key, r, size, opts)

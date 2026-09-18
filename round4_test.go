@@ -2,9 +2,12 @@ package certmanager
 
 import (
 	"context"
+	"crypto"
 	"crypto/tls"
 	"encoding/json"
 	"errors"
+	"io"
+	"log/slog"
 	"strconv"
 	"strings"
 	"testing"
@@ -283,48 +286,36 @@ func TestMaintainOnDemand_DoesNotAnnounceAChainStorageDoesNotHaveYet(t *testing.
 }
 
 // Re-running an activation must not restart the soak the operator is counting
-// down. The digest has been retiring since the first attempt.
-func TestActivateCertificateKey_DoesNotRestartTheSoakOnARetry(t *testing.T) {
+// down. The digest has been retiring since the first attempt, and the deadline
+// is what they are waiting on before dropping the old TLSA record.
+func TestMarkRetiring_IsIdempotentByDigest(t *testing.T) {
 	ctx := context.Background()
-	m, _, flaky := newFlakyManager(t, 100) // storage down, so the first attempt holds
+	m, _, flaky := newFlakyManager(t, 0)
 	m.dane = newDANEController(m.keyStore, flaky.Backend, "", []string{"mx.example.com"}, 3600, 24*time.Hour, testLogger())
 
-	if _, err := m.keyStore.GenerateNextCertKey(ctx, "mx.example.com"); err != nil {
+	if err := m.dane.markRetiring(ctx, "mx.example.com"); err != nil {
 		t.Fatal(err)
-	}
-	if err := m.ActivateCertificateKey("mx.example.com", true); !errors.Is(err, ErrOrderNotPersisted) {
-		t.Fatalf("first attempt: err = %v, want ErrOrderNotPersisted", err)
 	}
 	first, ok := soleRetiring(t, m, "mx.example.com")
 	if !ok {
-		t.Fatal("setup: the first attempt should have recorded the retiring digest")
+		t.Fatal("nothing recorded")
 	}
 
 	time.Sleep(1100 * time.Millisecond) // RetireAfter has one-second resolution
-	if err := m.ActivateCertificateKey("mx.example.com", true); !errors.Is(err, ErrOrderNotPersisted) {
-		t.Fatalf("second attempt: err = %v, want ErrOrderNotPersisted", err)
+	if err := m.dane.markRetiring(ctx, "mx.example.com"); err != nil {
+		t.Fatal(err)
 	}
 
 	second, ok := soleRetiring(t, m, "mx.example.com")
 	if !ok {
-		t.Fatal("the retiring record disappeared on the retry")
+		t.Fatal("the record disappeared on the second call")
 	}
 	if second.RetireAfter != first.RetireAfter {
 		t.Errorf("soak restarted: RetireAfter moved from %d to %d", first.RetireAfter, second.RetireAfter)
 	}
 	if second.Digest != first.Digest {
-		t.Errorf("retiring digest changed from %s to %s", first.Digest, second.Digest)
+		t.Errorf("digest changed from %s to %s", first.Digest, second.Digest)
 	}
-}
-
-// storedChain puts a certificate for host into both storage and memory, the
-// state announcement is allowed from.
-func storedChain(t *testing.T, m *Manager, host string, serial int64) *tls.Certificate {
-	t.Helper()
-	cert := holdChain(t, m, host, serial)
-	storeHeldChain(t, m, host)
-	m.certCache.dropPending(host)
-	return cert
 }
 
 // A second rotation inside the first one's soak is not a retry, and not a
@@ -613,5 +604,103 @@ func TestParseRetiring_DropsEntriesWithNoDigest(t *testing.T) {
 	}
 	if recs, err := dane.ParseRetiring([]byte(`{"digest":"","retire_after":1}`)); err != nil || len(recs) != 0 {
 		t.Fatalf("got %+v (%v), want none", recs, err)
+	}
+}
+
+// storedChain puts a certificate for host into both storage and memory, the
+// state announcement is allowed from.
+func storedChain(t *testing.T, m *Manager, host string, serial int64) *tls.Certificate {
+	t.Helper()
+	cert := holdChain(t, m, host, serial)
+	storeHeldChain(t, m, host)
+	m.certCache.dropPending(host)
+	return cert
+}
+
+// Recording the outgoing digest is not optional: promoting without it retires
+// that digest from a record nobody kept, and the operator then drops a TLSA
+// record every lagging node is still presenting.
+func TestActivateCertificateKey_WillNotPromoteWithoutTheRetiringRecord(t *testing.T) {
+	ctx := context.Background()
+	m, _, flaky := newFlakyManager(t, 0) // the chain stores fine
+	blind := &readErrorBackend{Backend: flaky.Backend, failGetFor: "dane/retiring/"}
+	m.dane = newDANEController(m.keyStore, blind, "", []string{"mx.example.com"}, 3600, 24*time.Hour, testLogger())
+
+	liveBefore, err := m.keyStore.LoadCertKey(ctx, "mx.example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.keyStore.GenerateNextCertKey(ctx, "mx.example.com"); err != nil {
+		t.Fatal(err)
+	}
+
+	err = m.ActivateCertificateKey("mx.example.com", true)
+	if err == nil || !strings.Contains(err.Error(), "retiring DANE digest") {
+		t.Fatalf("err = %v, want the ceremony stopped on the retiring record", err)
+	}
+
+	liveNow, err := m.keyStore.LoadCertKey(ctx, "mx.example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !liveNow.Public().(interface{ Equal(crypto.PublicKey) bool }).Equal(liveBefore.Public()) {
+		t.Fatal("the key was promoted although the outgoing digest was never recorded")
+	}
+}
+
+// A storage problem must not quietly mute the drift alarm: silence from an
+// alarm is indistinguishable from agreement.
+func TestVerifyPublished_SaysWhenItCannotComputeTheDesiredRecords(t *testing.T) {
+	ctx := context.Background()
+	m, _, flaky := newFlakyManager(t, 0)
+	blind := &readErrorBackend{Backend: flaky.Backend, failGetFor: "dane/retiring/"}
+	handler := &capturingHandler{Handler: slog.NewTextHandler(io.Discard, nil)}
+	m.dane = newDANEController(m.keyStore, blind, "", []string{"mx.example.com"}, 3600, 24*time.Hour, slog.New(handler))
+	m.dane.lookup = fakeLookup(dane.LookupResult{}, nil)
+
+	status := m.dane.verifyPublished(ctx)
+
+	if len(status) != 0 {
+		t.Fatalf("status = %v, want no host verified", status)
+	}
+	if !handler.warnedAbout("drift check skipped") {
+		t.Error("the drift alarm went quiet without saying why")
+	}
+}
+
+// Rolling an interrupted ceremony forward has the same rule as starting one: no
+// promotion until the outgoing digest is on record. Leaving it unfinished costs
+// a tick; finishing it without the record costs DANE.
+func TestReconcileCeremony_WillNotPromoteWithoutTheRetiringRecord(t *testing.T) {
+	ctx := context.Background()
+	m, _, flaky := newFlakyManager(t, persistAttempts)
+	blind := &readErrorBackend{Backend: flaky.Backend, failGetFor: "dane/retiring/"}
+	m.dane = newDANEController(m.keyStore, blind, "", []string{"mx.example.com"}, 3600, 24*time.Hour, testLogger())
+
+	liveBefore, err := m.keyStore.LoadCertKey(ctx, "mx.example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.keyStore.GenerateNextCertKey(ctx, "mx.example.com"); err != nil {
+		t.Fatal(err)
+	}
+	// Storage down: the chain is held and the key stays staged.
+	if err := m.ActivateCertificateKey("mx.example.com", true); !errors.Is(err, ErrOrderNotPersisted) {
+		t.Fatalf("setup: err = %v, want ErrOrderNotPersisted", err)
+	}
+	// The chain lands, but the retiring markers still cannot be read.
+	flaky.failPuts = 0
+	if stored := m.flushHeldChains(ctx); len(stored) != 1 {
+		t.Fatalf("setup: flush stored %v", stored)
+	}
+
+	m.reconcileCeremony(ctx, "mx.example.com")
+
+	liveNow, err := m.keyStore.LoadCertKey(ctx, "mx.example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !liveNow.Public().(interface{ Equal(crypto.PublicKey) bool }).Equal(liveBefore.Public()) {
+		t.Fatal("the ceremony completed although the outgoing digest was never recorded")
 	}
 }

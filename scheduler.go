@@ -487,10 +487,12 @@ func (m *Manager) reconcileCeremony(ctx context.Context, domain string) {
 		// here while the live key is still the OLD one — after the promotion
 		// below there is nothing left to read it from.
 		if m.dane != nil && m.dane.isMX(domain) {
-			// Idempotent by digest, so a re-run neither restarts the soak nor
-			// displaces another rotation's still-needed digest.
+			// Same rule as the activation itself: no promotion until the
+			// outgoing digest is on record. Leaving the ceremony unfinished
+			// costs a tick; finishing it without the record costs DANE.
 			if err := m.dane.markRetiring(ctx, domain); err != nil {
-				m.logger.Warn("TLS: failed to record retiring DANE digest", "domain", domain, "error", err)
+				m.logger.Warn("TLS: not completing the ceremony — the retiring DANE digest could not be recorded", "domain", domain, "error", err)
+				return
 			}
 		}
 		if err := m.keyStore.PromoteNextCertKey(ctx, domain); err != nil {
@@ -670,25 +672,34 @@ func (m *Manager) ActivateCertificateKey(domain string, force bool) error {
 	if err != nil && !heldNotStored {
 		return fmt.Errorf("store cert for %s: %w", domain, err)
 	}
-	// Record the OUTGOING (still-live) digest for the DANE soak window BEFORE
-	// promoting, so the operator keeps the old TLSA record published until lagging
-	// nodes converge on the new cert.
-	if m.dane != nil && m.dane.isMX(domain) {
-		// Idempotent by digest, so a re-run neither restarts the soak nor
-		// displaces another rotation's still-needed digest.
-		if err := m.dane.markRetiring(ctx, domain); err != nil {
-			m.logger.Warn("TLS: failed to record retiring DANE digest", "domain", domain, "error", err)
-		}
-	}
 	if heldNotStored {
 		// The ceremony's order is as spent as any other, so hold the chain
-		// rather than lose it. The key stays STAGED: promoting against a chain
-		// storage does not have would leave every follower unable to pair them.
-		// Once the flush lands the chain, reconcileCeremony promotes — the same
-		// roll-forward that covers a leader crashing between Store and Promote.
+		// rather than lose it — before anything below can fail and take it with
+		// it. The key stays STAGED: promoting against a chain storage does not
+		// have would leave every follower unable to pair them. Once the flush
+		// lands the chain, reconcileCeremony records the retiring digest and
+		// promotes — the same roll-forward that covers a leader crashing
+		// between Store and Promote, so neither step is skipped by returning
+		// here.
 		m.certCache.hold(domain, cert, chainPEM)
 		return fmt.Errorf("%w for %s: the replacement key stays staged and the ceremony completes once storage accepts the chain: %v",
 			ErrOrderNotPersisted, domain, err)
+	}
+
+	// Record the OUTGOING (still-live) digest for the DANE soak window BEFORE
+	// promoting, so the operator keeps the old TLSA record published until lagging
+	// nodes converge on the new cert.
+	//
+	// Idempotent by digest, so a re-run neither restarts the soak nor displaces
+	// another rotation's still-needed digest. A failure STOPS the ceremony:
+	// promoting without it retires the outgoing digest from a record nobody
+	// kept, so DesiredRecords would omit it, the operator would drop that TLSA
+	// record, and every node still serving the old chain would fail DANE. The
+	// chain is already stored, so reconcileCeremony rolls this forward later.
+	if m.dane != nil && m.dane.isMX(domain) {
+		if err := m.dane.markRetiring(ctx, domain); err != nil {
+			return fmt.Errorf("record retiring DANE digest for %s (the replacement key stays staged): %w", domain, err)
+		}
 	}
 	// Re-check leadership immediately before the destructive promote: if this node
 	// flapped during issuance, abort rather than overwrite the live key. The stored
