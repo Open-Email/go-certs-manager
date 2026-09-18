@@ -38,7 +38,26 @@ type certCache struct {
 
 	negMu sync.Mutex
 	neg   map[string]time.Time // domain -> last cache-miss time (follower read throttle)
+
+	pendingMu sync.Mutex
+	pending   map[string]pendingPersist // domain -> chain the CA issued that storage has not taken
 }
+
+// pendingPersist is a chain this node paid an order for and could not write.
+// See certCache.hold.
+type pendingPersist struct {
+	chainPEM []byte
+	notAfter time.Time
+}
+
+// persistAttempts and persistBackoff bound the immediate retry of a chain write.
+// They cover the transient blip (a dropped connection, a 503 from S3) without
+// holding the issuance lease for long; anything longer-lived is left to
+// flushPending on the maintenance tick, which is the real retry.
+const (
+	persistAttempts = 3
+	persistBackoff  = time.Second
+)
 
 // certMissNegativeTTL throttles follower storage reads: after a miss, a follower
 // won't re-read storage for a domain for this long, bounding storage load to ~one
@@ -56,6 +75,7 @@ func newCertCache(backend storage.Backend, basePrefix string, keyFor func(ctx co
 		logger:  logger,
 		mem:     make(map[string]*tls.Certificate),
 		neg:     make(map[string]time.Time),
+		pending: make(map[string]pendingPersist),
 	}
 }
 
@@ -75,19 +95,135 @@ func (c *certCache) Get(domain string) (*tls.Certificate, bool) {
 // memory. Used by the leader after issuance. key is the private key the chain was
 // issued against (the live key for renewals, the staged-next key during a
 // key-replacement ceremony) — it MUST match the chain's leaf.
+//
+// Two distinguishable failures, because the caller must treat them differently:
+// a chain that does not build is worthless and returns (nil, err); a chain that
+// builds but cannot be written returns (cert, err) wrapping errPersistFailed,
+// so the caller can decide whether to hold onto an order it has already paid
+// for. Nothing is installed in memory on either path — hold does that, once the
+// caller has decided.
 func (c *certCache) Store(ctx context.Context, domain string, chainPEM []byte, key crypto.Signer) (*tls.Certificate, error) {
 	cert, err := buildCertificate(chainPEM, key)
 	if err != nil {
 		return nil, err
 	}
-	data := string(chainPEM)
-	if err := c.backend.PutObject(ctx, c.chainKey(domain), strings.NewReader(data), int64(len(data)), storage.PutOptions{
-		ContentType: "application/x-pem-file",
-	}); err != nil {
-		return nil, fmt.Errorf("persist chain for %s: %w", domain, err)
+	if err := c.persist(ctx, domain, chainPEM); err != nil {
+		return cert, err
 	}
 	c.set(domain, cert)
+	c.dropPending(domain)
 	return cert, nil
+}
+
+// persist writes the chain, retrying a transient failure a few times. Returns an
+// error wrapping errPersistFailed so Store's caller can tell a storage problem
+// from an unusable chain.
+func (c *certCache) persist(ctx context.Context, domain string, chainPEM []byte) error {
+	var err error
+	for attempt := 1; ; attempt++ {
+		data := string(chainPEM)
+		err = c.backend.PutObject(ctx, c.chainKey(domain), strings.NewReader(data), int64(len(data)), storage.PutOptions{
+			ContentType: "application/x-pem-file",
+		})
+		if err == nil {
+			return nil
+		}
+		if attempt >= persistAttempts {
+			break
+		}
+		c.logger.Warn("TLS: storing the chain failed — retrying", "domain", domain, "attempt", attempt, "error", err)
+		select {
+		case <-time.After(time.Duration(attempt) * persistBackoff):
+		case <-ctx.Done():
+			return fmt.Errorf("persist chain for %s: %w: %v", domain, errPersistFailed, ctx.Err())
+		}
+	}
+	return fmt.Errorf("persist chain for %s: %w: %v", domain, errPersistFailed, err)
+}
+
+// hold serves a chain the CA issued that storage would not take, and remembers
+// it for flushPending to write later.
+//
+// The alternative is to drop it, which is what throwing the error away used to
+// mean: the order is spent either way — it counted against the CA's
+// duplicate-certificate limit the moment it was signed — so discarding it buys
+// nothing and costs the next attempt another order. Held in memory it is served
+// immediately, and it reaches storage as soon as storage recovers.
+func (c *certCache) hold(domain string, cert *tls.Certificate, chainPEM []byte) {
+	c.set(domain, cert)
+	c.pendingMu.Lock()
+	c.pending[strings.ToLower(domain)] = pendingPersist{chainPEM: chainPEM, notAfter: cert.Leaf.NotAfter}
+	c.pendingMu.Unlock()
+}
+
+func (c *certCache) dropPending(domain string) {
+	c.pendingMu.Lock()
+	delete(c.pending, strings.ToLower(domain))
+	c.pendingMu.Unlock()
+}
+
+// pendingDomains returns the domains currently held, for tests and logging.
+func (c *certCache) pendingDomains() []string {
+	c.pendingMu.Lock()
+	defer c.pendingMu.Unlock()
+	out := make([]string, 0, len(c.pending))
+	for d := range c.pending {
+		out = append(out, d)
+	}
+	return out
+}
+
+// flushPending retries the writes that failed, and is called on every
+// maintenance tick.
+//
+// It never overwrites a chain that is at least as new as the one it holds. A
+// node holding a pending write may have lost leadership in the meantime, and
+// the new leader's renewal is in storage; putting our older copy back on top of
+// it is how a fleet talks itself onto an expiring certificate. When storage has
+// caught up or moved ahead, the held copy is simply dropped.
+func (c *certCache) flushPending(ctx context.Context) {
+	c.pendingMu.Lock()
+	snapshot := make(map[string]pendingPersist, len(c.pending))
+	for d, p := range c.pending {
+		snapshot[d] = p
+	}
+	c.pendingMu.Unlock()
+
+	for domain, p := range snapshot {
+		if stored, err := c.loadChain(ctx, domain); err == nil {
+			if na, err := leafNotAfterPEM(stored); err == nil && !na.Before(p.notAfter) {
+				c.logger.Info("TLS: storage already holds a chain at least as new — dropping the held copy", "domain", domain)
+				c.dropPending(domain)
+				continue
+			}
+		}
+		if err := c.persist(ctx, domain, p.chainPEM); err != nil {
+			c.logger.Warn("TLS: still cannot store the issued chain — it stays in memory only", "domain", domain, "error", err)
+			continue
+		}
+		c.logger.Info("TLS: stored a chain that had been held in memory since issuance", "domain", domain)
+		c.dropPending(domain)
+	}
+}
+
+// leafNotAfterPEM reads the expiry of the first leaf in a PEM chain.
+func leafNotAfterPEM(chainPEM []byte) (time.Time, error) {
+	rest := chainPEM
+	for {
+		var block *pem.Block
+		block, rest = pem.Decode(rest)
+		if block == nil {
+			return time.Time{}, errors.New("no CERTIFICATE block in chain")
+		}
+		if block.Type != "CERTIFICATE" {
+			continue
+		}
+		leaf, err := x509.ParseCertificate(block.Bytes)
+		if err != nil {
+			return time.Time{}, err
+		}
+		return leaf.NotAfter, nil
+	}
 }
 
 // Refresh loads the durable chain for a domain and rebuilds the in-memory

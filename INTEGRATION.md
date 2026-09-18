@@ -217,6 +217,14 @@ For admin CLIs (`smtp-in-admin` etc.):
   maintenance loop covers the scheduled case — so each call spends one of Let's
   Encrypt's five duplicate certificates per week. It errors rather than answer
   with the existing certificate when a peer holds the issuance lease.
+
+  An error wrapping `certmanager.ErrOrderNotPersisted` is the one case the
+  caller must **not** retry: the CA issued the certificate — the order is spent
+  — but storage would not take it. The certificate is in memory and being
+  served, and every maintenance tick re-attempts the write until storage
+  accepts it. Surface it to the operator as its own outcome (a distinct exit
+  code, not the generic failure) so automation does not re-run the command and
+  spend a second order for a certificate the node already holds.
 - `mgr.DesiredTLSARecords(ctx)` — zone lines the operator must publish.
 - Key-replacement ceremony (leader-only):
   1. `mgr.ReplaceCertificateKey(domain)` → publish returned TLSA records

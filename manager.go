@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
@@ -543,6 +544,10 @@ func (m *Manager) issueWithKey(ctx context.Context, domain string, certKey crypt
 			domain, m.retries.max, wait.Round(time.Second))
 	}
 
+	// Taking the lease is a write, so reaching the CA at all means storage
+	// accepted an object from this node seconds ago. That is the cheapest
+	// guard against spending an order we cannot keep, and it is why no separate
+	// writability probe is needed here.
 	release, ok := m.acquireIssueLease(ctx, domain)
 	if !ok {
 		// Another node holds the issuance lease. Don't drive a duplicate ACME order;
@@ -584,7 +589,15 @@ func (m *Manager) issueWithKey(ctx context.Context, domain string, certKey crypt
 		// The order was already consumed; a retry drives a fresh one, so a
 		// persistent storage failure must also back off.
 		m.retries.recordFailure(domain)
-		return nil, err
+		if cert == nil || !errors.Is(err, errPersistFailed) {
+			return nil, err // the chain itself is unusable — nothing worth keeping
+		}
+		// Storage refused a certificate we have already paid for. Serve it and
+		// keep it for the next tick rather than discard it and order again.
+		m.certCache.hold(domain, cert, chainPEM)
+		m.logger.Error("TLS: certificate issued but NOT stored — serving it from memory and retrying the write each tick; do not re-run issuance, the order is spent",
+			"domain", domain, "not_after", cert.Leaf.NotAfter, "error", err)
+		return cert, fmt.Errorf("%w for %s: %v", ErrOrderNotPersisted, domain, err)
 	}
 	m.retries.reset(domain)
 	return cert, nil

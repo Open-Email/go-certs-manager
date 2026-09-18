@@ -39,6 +39,11 @@ func (m *Manager) maintainOnce() {
 	ctx, cancel := context.WithTimeout(context.Background(), issueTimeout+30*time.Second)
 	defer cancel()
 
+	// Before anything else: a chain the CA issued that storage would not take is
+	// still unwritten, and every tick it stays that way is a tick in which only
+	// this node's memory holds it.
+	m.certCache.flushPending(ctx)
+
 	leader := m.isLeader()
 	for _, domain := range m.domains {
 		if leader {

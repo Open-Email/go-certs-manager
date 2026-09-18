@@ -23,6 +23,7 @@ import (
 type countingCA struct {
 	orders int
 	err    error
+	chain  []byte // when set, answered instead of a freshly built chain
 }
 
 func (ca *countingCA) Issue(_ context.Context, domain string, certKey crypto.Signer) ([]byte, error) {
@@ -30,15 +31,22 @@ func (ca *countingCA) Issue(_ context.Context, domain string, certKey crypto.Sig
 	if ca.err != nil {
 		return nil, ca.err
 	}
+	if ca.chain != nil {
+		return ca.chain, nil
+	}
 	return chainWithSerial(certKey, domain, int64(100+ca.orders))
 }
 
 func chainWithSerial(key crypto.Signer, cn string, serial int64) ([]byte, error) {
+	return chainWithSerialNotAfter(key, cn, serial, time.Now().Add(90*24*time.Hour))
+}
+
+func chainWithSerialNotAfter(key crypto.Signer, cn string, serial int64, notAfter time.Time) ([]byte, error) {
 	tmpl := &x509.Certificate{
 		SerialNumber: big.NewInt(serial),
 		Subject:      pkix.Name{CommonName: cn},
 		NotBefore:    time.Now().Add(-time.Hour),
-		NotAfter:     time.Now().Add(90 * 24 * time.Hour),
+		NotAfter:     notAfter,
 		DNSNames:     []string{cn},
 	}
 	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, key.Public(), key)
