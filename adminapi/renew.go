@@ -11,6 +11,7 @@
 package adminapi
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -190,6 +191,70 @@ func RenewTransportFailure(err error) ([]string, int) {
 		"  The order may have gone ahead. DO NOT re-run this until the",
 		"  certificate listing shows it did not: re-running spends another.",
 	}, ExitStored
+}
+
+// Renew runs the client side of a renewal against endpoint, writes what the
+// operator needs to see to out, and returns the exit code the CLI should use.
+//
+// A CLI calls this and exits with the result; it owns every part that matters,
+// so none can be got wrong in one repository and right in another. The
+// preamble is written BEFORE the request, because the request always spends
+// an order. The HTTP client waits RenewTimeout, not whatever the CLI uses for
+// its quick commands — ten seconds was the bug that shipped. And a request
+// with no answer, or an answer cut off mid-body, goes through
+// RenewTransportFailure rather than being reported as an ordinary error.
+//
+// authorize adds the service's credentials to the request; nil for none.
+func Renew(out io.Writer, endpoint, domain string, authorize func(*http.Request)) int {
+	for _, line := range RenewPreamble(domain) {
+		fmt.Fprintln(out, line)
+	}
+
+	body, err := json.Marshal(map[string]string{"domain": domain})
+	if err != nil {
+		fmt.Fprintln(out, "✗ Certificate renewal failed")
+		fmt.Fprintln(out, "  "+err.Error())
+		return ExitFailed
+	}
+	req, err := http.NewRequest(http.MethodPost, endpoint, bytes.NewReader(body))
+	if err != nil {
+		fmt.Fprintln(out, "✗ Certificate renewal failed")
+		fmt.Fprintln(out, "  "+err.Error())
+		return ExitFailed
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if authorize != nil {
+		authorize(req)
+	}
+
+	var lines []string
+	var code int
+	resp, err := renewClient().Do(req)
+	if err != nil {
+		lines, code = RenewTransportFailure(err)
+	} else {
+		defer resp.Body.Close()
+		raw, rerr := io.ReadAll(resp.Body)
+		if rerr != nil {
+			// The status line arrived and the body did not: the order may well
+			// have gone through, so this is the unknown case, not a failure.
+			lines, code = RenewTransportFailure(rerr)
+		} else {
+			lines, code = RenewOutcome(resp.StatusCode, raw)
+		}
+	}
+	for _, line := range lines {
+		fmt.Fprintln(out, line)
+	}
+	return code
+}
+
+// renewClient is the HTTP client Renew uses. Separate so its deadline can be
+// asserted directly: the bug it exists to prevent — a ten-second client on a
+// two-minute order — cannot be caught by a test that waits less than ten
+// seconds.
+func renewClient() *http.Client {
+	return &http.Client{Timeout: RenewTimeout}
 }
 
 // RenewPreamble is what the CLI prints BEFORE the request. Before, not after:

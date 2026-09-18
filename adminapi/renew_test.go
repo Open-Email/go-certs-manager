@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -283,5 +284,152 @@ func TestRenewTransportFailure_RefusedConnectionIsSafeToRetry(t *testing.T) {
 func TestRenewTimeout_CoversTwoIssuanceWindows(t *testing.T) {
 	if RenewTimeout <= 2*certmanager.IssueTimeout {
 		t.Errorf("RenewTimeout %v does not cover a renewal queued behind another issuance (2 × %v)", RenewTimeout, certmanager.IssueTimeout)
+	}
+}
+
+// End to end through the shared handler: every outcome reaches the operator
+// with its exit code, the preamble comes first, and the credentials the CLI
+// supplies are what the service sees.
+func TestRenew_EndToEnd(t *testing.T) {
+	spent := fmt.Errorf("%w: storage unavailable", certmanager.ErrOrderNotPersisted)
+
+	for _, tc := range []struct {
+		name     string
+		err      error
+		wantExit int
+		wantLine string
+	}{
+		{"stored", nil, ExitOK, "ordered and stored"},
+		{"spent", spent, ExitStored, "DO NOT re-run"},
+		{"failed", errors.New("not the leader"), ExitFailed, "renewal failed"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			renewer := &stubRenewer{err: tc.err}
+			var sawAuth string
+			h := RenewHandler(func() Renewer { return renewer }, nil)
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				sawAuth = r.Header.Get("Authorization")
+				h.ServeHTTP(w, r)
+			}))
+			defer srv.Close()
+
+			var out strings.Builder
+			exit := Renew(&out, srv.URL, "mx.example.com", func(r *http.Request) {
+				r.Header.Set("Authorization", "Bearer secret")
+			})
+
+			if exit != tc.wantExit {
+				t.Errorf("exit = %d, want %d\n%s", exit, tc.wantExit, out.String())
+			}
+			if !strings.Contains(out.String(), tc.wantLine) {
+				t.Errorf("output does not mention %q:\n%s", tc.wantLine, out.String())
+			}
+			if !strings.HasPrefix(out.String(), "Renewing mx.example.com") {
+				t.Errorf("the preamble is not first:\n%s", out.String())
+			}
+			if sawAuth != "Bearer secret" {
+				t.Errorf("service saw Authorization %q; the CLI's credentials were not applied", sawAuth)
+			}
+		})
+	}
+}
+
+// A slow renewal still reaches the CLI through a service whose own
+// WriteTimeout is far shorter.
+func TestRenew_SlowServiceStillAnswers(t *testing.T) {
+	renewer := &stubRenewer{delay: 1500 * time.Millisecond}
+	srv := httptest.NewUnstartedServer(RenewHandler(func() Renewer { return renewer }, nil))
+	srv.Config.WriteTimeout = 200 * time.Millisecond
+	srv.Start()
+	defer srv.Close()
+
+	var out strings.Builder
+	if exit := Renew(&out, srv.URL, "mx.example.com", nil); exit != ExitOK {
+		t.Fatalf("exit = %d, want %d:\n%s", exit, ExitOK, out.String())
+	}
+}
+
+// The bug that shipped was a ten-second client on a two-minute order. Asserted
+// directly, because no test that finishes in reasonable time can wait it out.
+func TestRenewClient_WaitsForAWholeRenewal(t *testing.T) {
+	if got := renewClient().Timeout; got < RenewTimeout {
+		t.Fatalf("client gives up after %v; a renewal can take %v", got, RenewTimeout)
+	}
+}
+
+// A service that is down ordered nothing: exit 1, and say so.
+func TestRenew_ServiceDownIsSafeToRetry(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr := ln.Addr().String()
+	ln.Close()
+
+	var out strings.Builder
+	if exit := Renew(&out, "http://"+addr, "mx.example.com", nil); exit != ExitFailed {
+		t.Fatalf("exit = %d, want %d:\n%s", exit, ExitFailed, out.String())
+	}
+	if !strings.Contains(out.String(), "nothing was ordered") {
+		t.Errorf("does not say nothing was ordered:\n%s", out.String())
+	}
+}
+
+// lockedBuffer lets the server goroutine read what the CLI has written so far.
+type lockedBuffer struct {
+	mu  sync.Mutex
+	buf strings.Builder
+}
+
+func (b *lockedBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *lockedBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
+// The preamble has to be on screen BEFORE the order is placed — printed after,
+// it tells the operator what they already spent. Checked from inside the
+// service, at the moment the request arrives: output order alone cannot tell
+// "before the request" from "after the request, before the result".
+func TestRenew_WarnsBeforeTheRequestReachesTheService(t *testing.T) {
+	out := &lockedBuffer{}
+	var atArrival string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atArrival = out.String()
+		WriteRenewResult(w, "mx.example.com", []string{"mx.example.com"}, nil)
+	}))
+	defer srv.Close()
+
+	Renew(out, srv.URL, "mx.example.com", nil)
+
+	if !strings.Contains(atArrival, "NEW order") {
+		t.Fatalf("when the request reached the service the operator had seen only %q; the warning came too late", atArrival)
+	}
+}
+
+// A status line that arrives without its body is not a failure: the service
+// may well have placed the order and been cut off saying so.
+func TestRenew_AnAnswerCutOffMidBodyIsOutcomeUnknown(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, buf, err := w.(http.Hijacker).Hijack()
+		if err != nil {
+			t.Errorf("hijack: %v", err)
+			return
+		}
+		buf.WriteString("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 200\r\n\r\n{\"status\":")
+		buf.Flush()
+		conn.Close()
+	}))
+	defer srv.Close()
+
+	var out strings.Builder
+	if exit := Renew(&out, srv.URL, "mx.example.com", nil); exit != ExitStored {
+		t.Fatalf("exit = %d, want %d — the order may have gone through:\n%s", exit, ExitStored, out.String())
 	}
 }

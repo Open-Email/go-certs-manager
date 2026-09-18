@@ -233,13 +233,13 @@ For admin CLIs (`smtp-in-admin` etc.):
     server's `WriteTimeout` is sized in seconds — cut off, the client learns
     nothing about an order that went ahead. The func may return nil until the
     manager exists; the endpoint answers 501 until it does.
-  - **CLI:** print `adminapi.RenewPreamble(domain)` BEFORE the request (it
-    always spends an order), give the HTTP client at least
-    `adminapi.RenewTimeout`, and exit with the code from
-    `adminapi.RenewOutcome(status, body)` — or from
-    `adminapi.RenewTransportFailure(err)` if no answer came back, which is
-    outcome-unknown and never retryable. `0` ordered and stored, `2` spent or
-    unknown — do not re-run, `1` failed.
+  - **CLI:** `os.Exit(adminapi.Renew(os.Stdout, endpoint, domain,
+    authorize))`, where `authorize` adds your service's credentials. It owns
+    everything that can be got wrong: the warning is printed BEFORE the order is
+    placed, the client waits `adminapi.RenewTimeout` rather than your quick-
+    command timeout, and a request with no answer is outcome-unknown rather than
+    a failure. Exit `0` ordered and stored, `2` spent or unknown — do not re-run,
+    `1` nothing was ordered.
 - `mgr.DesiredTLSARecords(ctx)` — zone lines the operator must publish. It now
   returns an **error** rather than an incomplete set when the retiring markers
   cannot be read: answering without them would name a set that omits digests
