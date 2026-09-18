@@ -250,3 +250,66 @@ func storeHeldChain(t *testing.T, m *Manager, domain string) {
 		t.Fatal(err)
 	}
 }
+
+// The index says what STORAGE holds. Announcing a chain that is only in memory
+// tells followers to adopt what is actually there — the older chain — and to
+// record themselves current at the expiry we announced, after which the real
+// write lands on the same value and their diff never fires again.
+func TestMaintainOnDemand_DoesNotAnnounceAChainStorageDoesNotHaveYet(t *testing.T) {
+	fs, err := storage.NewFilesystemBackend(t.TempDir(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := onDemandLeader(t, fs, &countingCA{}, "vanity.example.com")
+	holdChain(t, m, "vanity.example.com", 71) // memory only; storage has nothing
+
+	m.maintainOnDemand(true)
+
+	if _, known := m.onDemand.indexNotAfter("vanity.example.com"); known {
+		t.Fatal("announced a chain that is not in storage; followers would adopt something older and stop looking")
+	}
+
+	// Once it really is stored, it is announced.
+	storeHeldChain(t, m, "vanity.example.com")
+	m.certCache.dropPending("vanity.example.com")
+	m.maintainOnDemand(true)
+
+	if _, known := m.onDemand.indexNotAfter("vanity.example.com"); !known {
+		t.Error("a stored chain was still not announced")
+	}
+}
+
+// Re-running an activation must not restart the soak the operator is counting
+// down. The digest has been retiring since the first attempt.
+func TestActivateCertificateKey_DoesNotRestartTheSoakOnARetry(t *testing.T) {
+	ctx := context.Background()
+	m, _, flaky := newFlakyManager(t, 100) // storage down, so the first attempt holds
+	m.dane = newDANEController(m.keyStore, flaky.Backend, "", []string{"mx.example.com"}, 3600, 24*time.Hour, testLogger())
+
+	if _, err := m.keyStore.GenerateNextCertKey(ctx, "mx.example.com"); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.ActivateCertificateKey("mx.example.com", true); !errors.Is(err, ErrOrderNotPersisted) {
+		t.Fatalf("first attempt: err = %v, want ErrOrderNotPersisted", err)
+	}
+	first, ok := m.dane.getRetiring(ctx, "mx.example.com")
+	if !ok {
+		t.Fatal("setup: the first attempt should have recorded the retiring digest")
+	}
+
+	time.Sleep(1100 * time.Millisecond) // RetireAfter has one-second resolution
+	if err := m.ActivateCertificateKey("mx.example.com", true); !errors.Is(err, ErrOrderNotPersisted) {
+		t.Fatalf("second attempt: err = %v, want ErrOrderNotPersisted", err)
+	}
+
+	second, ok := m.dane.getRetiring(ctx, "mx.example.com")
+	if !ok {
+		t.Fatal("the retiring record disappeared on the retry")
+	}
+	if second.RetireAfter != first.RetireAfter {
+		t.Errorf("soak restarted: RetireAfter moved from %d to %d", first.RetireAfter, second.RetireAfter)
+	}
+	if second.Digest != first.Digest {
+		t.Errorf("retiring digest changed from %s to %s", first.Digest, second.Digest)
+	}
+}

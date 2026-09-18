@@ -196,6 +196,15 @@ func (c *certCache) heldChainFor(domain string, key crypto.Signer) ([]byte, *tls
 	return p.chainPEM, cert, true
 }
 
+// isPending reports whether this domain's chain is held in memory and not yet
+// in storage.
+func (c *certCache) isPending(domain string) bool {
+	c.pendingMu.Lock()
+	defer c.pendingMu.Unlock()
+	_, ok := c.pending[strings.ToLower(domain)]
+	return ok
+}
+
 // pendingSnapshot copies the held chains so the caller can work through them
 // without holding the lock across storage calls.
 func (c *certCache) pendingSnapshot() map[string]pendingPersist {

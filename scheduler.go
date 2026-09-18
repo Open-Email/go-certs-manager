@@ -104,10 +104,17 @@ func (m *Manager) maintainOnce() {
 		}()
 	}
 
+	// Its own deadline, not the one the loop above just spent: with a domain
+	// per context that outer budget can be long gone by now, and a drift alarm
+	// running on a dead context does not fail — it silently reports nothing,
+	// which is the one thing an alarm must never do.
+	daneCtx, daneCancel := m.tickContext(issueTimeout)
+	defer daneCancel()
+
 	// Drift alarm: leader-only so a mismatch alerts once, not once per node.
 	if m.dane != nil && leader {
-		m.dane.cleanupExpiredRetiring(ctx)
-		for host, ok := range m.dane.verifyPublished(ctx) {
+		m.dane.cleanupExpiredRetiring(daneCtx)
+		for host, ok := range m.dane.verifyPublished(daneCtx) {
 			if m.onDANEMatch != nil {
 				m.onDANEMatch(host, ok)
 			}
@@ -184,7 +191,13 @@ func (m *Manager) maintainOnDemand(leader bool) {
 			// them would ever reach the announcement at the end of a run, and
 			// the hostname would stay invisible to every follower until it
 			// expired. Say it now — the leader is the only one who may.
-			if !known {
+			// Held but unstored is exactly what must NOT be announced: the
+			// index says what storage holds, and a follower that believed this
+			// entry would adopt the older chain still in storage, record itself
+			// current at the announced expiry, and never see a difference again
+			// when the real write finally lands. The flush announces it, once
+			// storage actually has it.
+			if !known && !m.certCache.isPending(host) {
 				m.recordIssued(loadCtx, host)
 			}
 			continue
@@ -658,9 +671,15 @@ func (m *Manager) ActivateCertificateKey(domain string, force bool) error {
 	// Record the OUTGOING (still-live) digest for the DANE soak window BEFORE
 	// promoting, so the operator keeps the old TLSA record published until lagging
 	// nodes converge on the new cert.
+	// Only when absent. Re-running an activation is an ordinary flow now that a
+	// held order is reused, and a second write would push RetireAfter forward —
+	// restarting the soak the operator is counting down, on a digest that has
+	// been retiring since the first attempt.
 	if m.dane != nil && m.dane.isMX(domain) {
-		if err := m.dane.markRetiring(ctx, domain); err != nil {
-			m.logger.Warn("TLS: failed to record retiring DANE digest", "domain", domain, "error", err)
+		if _, recorded := m.dane.getRetiring(ctx, domain); !recorded {
+			if err := m.dane.markRetiring(ctx, domain); err != nil {
+				m.logger.Warn("TLS: failed to record retiring DANE digest", "domain", domain, "error", err)
+			}
 		}
 	}
 	if heldNotStored {
