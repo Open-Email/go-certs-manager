@@ -780,7 +780,26 @@ type keyedMutex struct {
 }
 
 func (k *keyedMutex) lock(key string) func() {
+	mu := k.forKey(key)
+	mu.Lock()
+	return mu.Unlock
+}
+
+// tryLock takes the key's mutex only if it is free, for callers that would
+// rather skip a busy domain than queue behind it. The holder is issuing or
+// storing for that domain, which supersedes anything the caller was going to do
+// with it anyway.
+func (k *keyedMutex) tryLock(key string) (func(), bool) {
+	mu := k.forKey(key)
+	if !mu.TryLock() {
+		return nil, false
+	}
+	return mu.Unlock, true
+}
+
+func (k *keyedMutex) forKey(key string) *sync.Mutex {
 	k.mu.Lock()
+	defer k.mu.Unlock()
 	if k.m == nil {
 		k.m = make(map[string]*sync.Mutex)
 	}
@@ -789,7 +808,5 @@ func (k *keyedMutex) lock(key string) func() {
 		mu = &sync.Mutex{}
 		k.m[key] = mu
 	}
-	k.mu.Unlock()
-	mu.Lock()
-	return mu.Unlock
+	return mu
 }

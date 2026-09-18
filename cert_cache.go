@@ -197,7 +197,14 @@ func (c *certCache) storedNotAfter(ctx context.Context, domain string) (time.Tim
 	if err != nil {
 		return time.Time{}, err
 	}
-	return leafNotAfterPEM(chainPEM)
+	notAfter, err := leafNotAfterPEM(chainPEM)
+	if err != nil {
+		// Wrapped, not returned raw: "I read it and it is garbage" must not
+		// reach the caller looking like "I could not read it", which is the one
+		// answer that forbids writing.
+		return time.Time{}, fmt.Errorf("%w for %s: %v", errStoredChainUnparseable, domain, err)
+	}
+	return notAfter, nil
 }
 
 // leafNotAfterPEM reads the expiry of the first leaf in a PEM chain.

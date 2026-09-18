@@ -310,7 +310,12 @@ func (o *onDemand) refreshFollower(ctx context.Context) error {
 }
 
 // noteIssued records a hostname's expiry in the shared index (leader side).
-func (o *onDemand) noteIssued(ctx context.Context, hostname string, notAfter time.Time) {
+//
+// The returned error is the publication's, not the record's: the entry is in
+// the in-memory map before the write, so the next hostname to publish carries
+// it along. A caller with nothing else to publish should say so rather than
+// assume followers were told.
+func (o *onDemand) noteIssued(ctx context.Context, hostname string, notAfter time.Time) error {
 	// The write lock is held across the marshal AND the put, not just the map
 	// update. With MaxConcurrentOrders issuances in flight, two goroutines that
 	// snapshotted independently would race their puts, and the later-landing
@@ -336,9 +341,9 @@ func (o *onDemand) noteIssued(ctx context.Context, hostname string, notAfter tim
 
 	body, err := json.Marshal(snapshot)
 	if err != nil {
-		return
+		return err
 	}
-	_ = o.backend.PutObject(ctx, o.key(certIndexKey), bytes.NewReader(body),
+	return o.backend.PutObject(ctx, o.key(certIndexKey), bytes.NewReader(body),
 		int64(len(body)), storage.PutOptions{ContentType: "application/json"})
 }
 

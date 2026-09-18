@@ -3,6 +3,9 @@ package certmanager
 import (
 	"context"
 	"crypto"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/pem"
@@ -325,8 +328,9 @@ func TestFlushHeldChains_AdoptsTheNewerChainItDefersTo(t *testing.T) {
 }
 
 // A peer flushing or issuing the same domain must not race us: two nodes each
-// holding a chain could otherwise land in either order, and the older last.
-func TestFlushHeldChains_WaitsForTheIssuanceLease(t *testing.T) {
+// holding a chain could otherwise land in either order, and the older last. The
+// flush skips the domain for this tick rather than queueing behind it.
+func TestFlushHeldChains_SkipsWhenTheIssuanceLeaseIsHeld(t *testing.T) {
 	m, _, flaky := newFlakyManager(t, persistAttempts)
 	ctx := context.Background()
 
@@ -509,5 +513,179 @@ func TestMaintainOnce_FlushesAndAnnouncesAHeldChain(t *testing.T) {
 	}
 	if !notAfter.Equal(cert.Leaf.NotAfter) {
 		t.Fatalf("index says %v, certificate says %v", notAfter, cert.Leaf.NotAfter)
+	}
+}
+
+// A stored object that reads fine but is not a chain must be replaced, not
+// treated like a read failure: refusing to write would strand the domain until
+// an operator deleted the object by hand.
+func TestFlushHeldChains_ReplacesAnUnreadableStoredChain(t *testing.T) {
+	m, _, flaky := newFlakyManager(t, persistAttempts)
+	ctx := context.Background()
+
+	if err := m.renewIfNeeded(ctx, "mx.example.com"); !errors.Is(err, ErrOrderNotPersisted) {
+		t.Fatalf("setup: err = %v, want ErrOrderNotPersisted", err)
+	}
+	held, _ := m.certCache.Get("mx.example.com")
+	flaky.failPuts = 0
+
+	junk := []byte("-----BEGIN CERTIFICATE-----\nnot base64 at all\n-----END CERTIFICATE-----\n")
+	if err := flaky.PutObject(ctx, "certs/mx.example.com", strings.NewReader(string(junk)),
+		int64(len(junk)), storage.PutOptions{ContentType: "application/x-pem-file"}); err != nil {
+		t.Fatal(err)
+	}
+
+	if stored := m.flushHeldChains(ctx); len(stored) != 1 {
+		t.Fatalf("flush stored %v, want the held chain to replace the unreadable object", stored)
+	}
+	got, err := m.certCache.storedNotAfter(ctx, "mx.example.com")
+	if err != nil {
+		t.Fatalf("storage still unreadable after the flush: %v", err)
+	}
+	if !got.Equal(held.Leaf.NotAfter) {
+		t.Fatalf("storage holds notAfter %v, want the held chain's %v", got, held.Leaf.NotAfter)
+	}
+}
+
+// If the newer stored chain cannot be adopted, the held one must NOT be
+// dropped: memory would keep serving the superseded SPKI with nothing left to
+// notice it. Keeping it pending means the next tick tries the adoption again.
+func TestFlushHeldChains_KeepsHoldingWhenAdoptionFails(t *testing.T) {
+	m, _, flaky := newFlakyManager(t, persistAttempts)
+	ctx := context.Background()
+
+	if err := m.renewIfNeeded(ctx, "mx.example.com"); !errors.Is(err, ErrOrderNotPersisted) {
+		t.Fatalf("setup: err = %v, want ErrOrderNotPersisted", err)
+	}
+	held, _ := m.certCache.Get("mx.example.com")
+	flaky.failPuts = 0
+
+	// A newer chain bound to a DIFFERENT key — what a peer's key replacement
+	// looks like before the key promotion reaches this node.
+	otherKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	peerChain, err := chainWithSerialNotAfter(otherKey, "mx.example.com", 99, held.Leaf.NotAfter.Add(24*time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := m.certCache.persist(ctx, "mx.example.com", peerChain, 1); err != nil {
+		t.Fatal(err)
+	}
+
+	m.flushHeldChains(ctx)
+
+	if got := m.certCache.pendingDomains(); len(got) != 1 {
+		t.Fatalf("held %v after a failed adoption, want the chain kept for the next tick", got)
+	}
+}
+
+// The flush must not queue behind an issuance holding the same domain's lock:
+// that lock is held across a whole ACME order, well past the flush's deadline.
+func TestFlushHeldChains_SkipsADomainAlreadyBeingIssued(t *testing.T) {
+	m, _, flaky := newFlakyManager(t, persistAttempts)
+	ctx := context.Background()
+
+	if err := m.renewIfNeeded(ctx, "mx.example.com"); !errors.Is(err, ErrOrderNotPersisted) {
+		t.Fatalf("setup: err = %v, want ErrOrderNotPersisted", err)
+	}
+	flaky.failPuts = 0
+
+	unlock := m.inflight.lock("mx.example.com")
+	done := make(chan []string, 1)
+	go func() { done <- m.flushHeldChains(ctx) }()
+
+	select {
+	case stored := <-done:
+		if len(stored) != 0 {
+			t.Fatalf("flush stored %v while an issuance held the domain", stored)
+		}
+	case <-time.After(3 * time.Second):
+		unlock()
+		t.Fatal("flush blocked on the in-flight issuance instead of skipping the domain")
+	}
+	unlock()
+
+	if stored := m.flushHeldChains(ctx); len(stored) != 1 {
+		t.Fatalf("flush stored %v once the domain was free, want [mx.example.com]", stored)
+	}
+}
+
+// demotingBackend flips the node out of leadership at the moment the flush
+// writes, reproducing the window the flush opened: it can run for minutes
+// against degraded storage, and leadership read before it is stale by the time
+// anything is decided with it.
+type demotingBackend struct {
+	storage.Backend
+	demoted *bool
+}
+
+func (b *demotingBackend) PutObject(ctx context.Context, key string, r io.Reader, size int64, opts storage.PutOptions) error {
+	err := b.Backend.PutObject(ctx, key, r, size, opts)
+	if strings.Contains(key, "certs/") {
+		*b.demoted = true
+	}
+	return err
+}
+
+// Leadership must be read after the flush, not before. A node demoted while
+// flushing would otherwise publish its own in-memory index over the new
+// leader's — the shared-state write the leader check exists to prevent.
+func TestMaintainOnce_DoesNotAnnounceAfterLosingLeadershipDuringTheFlush(t *testing.T) {
+	fs, err := storage.NewFilesystemBackend(t.TempDir(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	demoted := false
+	backend := &demotingBackend{Backend: fs, demoted: &demoted}
+	leaderF := func() bool { return !demoted }
+
+	ks := NewKeyStore(backend, "", KeyTypeECDSAP256, func() bool { return true }, nil)
+	m := &Manager{
+		keyStore:    ks,
+		certCache:   newCertCache(backend, "", ks.LoadCertKey, nil),
+		logger:      testLogger(),
+		domainSet:   map[string]bool{"mx.example.com": true},
+		isLeaderF:   leaderF,
+		renewBefore: 30 * 24 * time.Hour,
+		retries:     newRetryBudget(3),
+	}
+	m.onDemand = newOnDemand(OnDemandConfig{}, backend, "")
+	holdChain(t, m, "vanity.example.com", 31)
+
+	if !m.isLeader() {
+		t.Fatal("setup: should start as leader")
+	}
+
+	m.maintainOnce()
+
+	if !demoted {
+		t.Fatal("setup: the flush never wrote, so leadership never changed")
+	}
+	if _, err := m.certCache.loadChain(context.Background(), "vanity.example.com"); err != nil {
+		t.Fatalf("the held chain was not stored: %v", err)
+	}
+	if _, known := m.onDemand.indexNotAfter("vanity.example.com"); known {
+		t.Error("a node demoted during the flush published to the shared on-demand index")
+	}
+}
+
+// noteIssued's error is the publication's: a caller that assumes silence means
+// followers were told will leave a certificate nobody reads.
+func TestNoteIssued_ReportsAFailedPublication(t *testing.T) {
+	fs, err := storage.NewFilesystemBackend(t.TempDir(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	backend := &flakyBackend{Backend: fs, failFor: certIndexKey, failPuts: 1}
+	od := newOnDemand(OnDemandConfig{}, backend, "")
+
+	if err := od.noteIssued(context.Background(), "vanity.example.com", time.Now().Add(time.Hour)); err == nil {
+		t.Fatal("noteIssued reported success though the index write failed")
+	}
+	// Recorded in memory all the same, so the next publication carries it.
+	if _, known := od.indexNotAfter("vanity.example.com"); !known {
+		t.Error("the entry was dropped from the in-memory index, so nothing will republish it")
 	}
 }

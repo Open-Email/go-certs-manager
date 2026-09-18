@@ -44,14 +44,17 @@ func (m *Manager) startMaintenance() {
 }
 
 func (m *Manager) maintainOnce() {
-	leader := m.isLeader()
-
 	// Held chains first, on their OWN budget. Sharing the tick's context would
 	// let a storage outage — the only way chains pile up — eat the deadline that
 	// the renewals and the follower refresh below depend on.
 	flushCtx, cancelFlush := context.WithTimeout(context.Background(), flushTimeout)
 	stored := m.flushHeldChains(flushCtx)
 	cancelFlush()
+
+	// Read AFTER the flush, never before: the flush can run for minutes against
+	// degraded storage, and leadership decides everything below — including
+	// whether this node may publish to the shared index at all.
+	leader := m.isLeader()
 
 	ctx, cancel := context.WithTimeout(context.Background(), issueTimeout+30*time.Second)
 	defer cancel()
@@ -236,8 +239,16 @@ func (m *Manager) announceStoredChains(ctx context.Context, leader bool, stored 
 		if m.domainSet[domain] {
 			continue
 		}
-		if notAfter, ok := m.certCache.leafNotAfter(domain); ok {
-			m.onDemand.noteIssued(ctx, domain, notAfter)
+		notAfter, ok := m.certCache.leafNotAfter(domain)
+		if !ok {
+			continue
+		}
+		if err := m.onDemand.noteIssued(ctx, domain, notAfter); err != nil {
+			// Not fatal and not retried here: the entry is in the in-memory
+			// index, so the next hostname this leader publishes carries it. On a
+			// fleet with no other on-demand churn it waits for that.
+			m.logger.Warn("TLS: stored a chain but could not publish the on-demand index — followers will not refresh it yet",
+				"domain", domain, "error", err)
 		}
 	}
 }
@@ -277,10 +288,23 @@ func (m *Manager) flushHeldChains(ctx context.Context) []string {
 	return stored
 }
 
+// errStoredChainUnparseable marks a stored object that was read but is not a
+// chain. Distinct from a read failure because it means the opposite: we know
+// what storage holds, and it is worthless, so ours is safe to write over.
+var errStoredChainUnparseable = errors.New("tls: stored chain could not be parsed")
+
 // flushOne is one domain's flush, split out so the lock and lease releases are
 // plain defers rather than a hand-unwound loop body.
 func (m *Manager) flushOne(ctx context.Context, domain string, p pendingPersist) bool {
-	unlock := m.inflight.lock(domain)
+	// tryLock, not lock: the holder is an issuance or an operator's renewal for
+	// this same domain, whose result supersedes what we hold — and it keeps the
+	// mutex across a whole ACME order, which would park the flush well past its
+	// own deadline and delay every domain queued behind it.
+	unlock, free := m.inflight.tryLock(domain)
+	if !free {
+		m.logger.Debug("TLS: not flushing a held chain — issuance in progress for it", "domain", domain)
+		return false
+	}
 	defer unlock()
 
 	release, ok := m.acquireIssueLease(ctx, domain)
@@ -292,20 +316,30 @@ func (m *Manager) flushOne(ctx context.Context, domain string, p pendingPersist)
 
 	switch notAfter, err := m.certCache.storedNotAfter(ctx, domain); {
 	case err == nil && !notAfter.Before(p.notAfter):
-		// Storage moved on without us. Drop what we hold AND take what is there:
-		// leaving the older chain in memory would keep this node serving a
-		// superseded SPKI, which after a peer's key replacement is a DANE
-		// mismatch rather than merely a stale certificate.
-		m.logger.Info("TLS: storage holds a chain at least as new — dropping the held copy", "domain", domain)
-		if _, err := m.certCache.Refresh(ctx, domain); err != nil {
-			m.logger.Warn("TLS: could not adopt the stored chain after dropping the held one", "domain", domain, "error", err)
+		// Storage moved on without us. Take what is there BEFORE letting go of
+		// what we hold: leaving the older chain in memory would keep this node
+		// serving a superseded SPKI, which after a peer's key replacement is a
+		// DANE failure rather than a stale certificate. If the adoption fails —
+		// a half-finished ceremony elsewhere reads as ErrKeyCertMismatch — keep
+		// holding, so the next tick tries again instead of stranding memory on
+		// the old chain with nothing left to notice it.
+		if _, rerr := m.certCache.Refresh(ctx, domain); rerr != nil {
+			m.logger.Warn("TLS: storage is ahead but its chain could not be adopted — holding on and retrying next tick",
+				"domain", domain, "error", rerr)
+			return false
 		}
+		m.logger.Info("TLS: storage holds a chain at least as new — dropping the held copy", "domain", domain)
 		m.certCache.dropPending(domain)
 		return false
 	case err == nil:
 		// Storage is behind ours — write.
 	case errors.Is(err, os.ErrNotExist):
 		// Storage has nothing — write.
+	case errors.Is(err, errStoredChainUnparseable):
+		// Storage holds something that is not a chain. Read, not guessed: ours
+		// is unambiguously better, and refusing here would strand the domain
+		// until an operator deleted the object by hand.
+		m.logger.Warn("TLS: the stored chain is unreadable — replacing it with the held one", "domain", domain)
 	default:
 		m.logger.Warn("TLS: cannot check what storage holds — leaving the held chain alone", "domain", domain, "error", err)
 		return false
