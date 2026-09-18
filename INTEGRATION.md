@@ -225,13 +225,31 @@ For admin CLIs (`smtp-in-admin` etc.):
   accepts it. Surface it to the operator as its own outcome (a distinct exit
   code, not the generic failure) so automation does not re-run the command and
   spend a second order for a certificate the node already holds.
-- `mgr.DesiredTLSARecords(ctx)` — zone lines the operator must publish.
+- `mgr.DesiredTLSARecords(ctx)` — zone lines the operator must publish. It now
+  returns an **error** rather than an incomplete set when the retiring markers
+  cannot be read: answering without them would name a set that omits digests
+  the fleet is still serving, which is an instruction to break DANE.
 - Key-replacement ceremony (leader-only):
   1. `mgr.ReplaceCertificateKey(domain)` → publish returned TLSA records
   2. wait for DNS TTL propagation
   3. `mgr.ActivateCertificateKey(domain, force)` — gated on the staged record
      being visible in DNS (`force` skips, e.g. split-horizon)
   4. after the soak window (logged), retire the old TLSA record
+
+  Step 3 **aborts rather than promote** if it cannot record the outgoing
+  digest as retiring. The key stays staged and the maintenance loop completes
+  the ceremony once storage answers; promoting without that record would have
+  you retire a TLSA record that lagging nodes are still presenting. A failure
+  wrapping `ErrOrderNotPersisted` means the order was placed and held but not
+  stored — re-running is safe and reuses it rather than ordering again.
+
+  A host can be retiring **more than one digest at once**: rotate twice inside
+  one soak and both previous digests stay published until each expires. The
+  marker at `dane/retiring/<host>` is therefore a JSON array when it holds more
+  than one, and a bare object when it holds exactly one — the older form, which
+  readers before v0.6.2 understand. Those readers cannot parse the array, so a
+  fleet must be upgraded together before anyone rotates a key twice within a
+  soak window (2 × max(maintenance interval, TLSA TTL), at least 10 minutes).
 - Raw storage inspection: read `certs/<domain>`, `keys/<domain>` via the
   `storage.Backend` — object layout is documented in the README.
 
