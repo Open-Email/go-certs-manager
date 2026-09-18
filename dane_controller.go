@@ -119,12 +119,16 @@ func (d *daneController) recordsForHost(ctx context.Context, host string) ([]dan
 	// digest until RetireAfter so DANE validation on lagging nodes still serving the
 	// old certificate does not fail. Pure read — the leader clears expired markers in
 	// cleanupExpiredRetiring.
-	if rec, ok := d.getRetiring(ctx, host); ok && time.Now().Unix() < rec.RetireAfter {
-		if rec.Digest != liveDigest && rec.Digest != nextDigest {
-			r := dane.NewSPKIRecord(host, rec.Digest, d.ttl)
-			r.Note = "retiring — keep published until " + time.Unix(rec.RetireAfter, 0).UTC().Format(time.RFC3339)
-			records = append(records, r)
+	// EVERY unexpired one: overlapping rotations leave more than one digest
+	// still being served somewhere in the fleet.
+	now := time.Now()
+	for _, rec := range d.retiring(ctx, host) {
+		if rec.Expired(now) || rec.Digest == liveDigest || rec.Digest == nextDigest {
+			continue
 		}
+		r := dane.NewSPKIRecord(host, rec.Digest, d.ttl)
+		r.Note = "retiring — keep published until " + time.Unix(rec.RetireAfter, 0).UTC().Format(time.RFC3339)
+		records = append(records, r)
 	}
 
 	return records, nil
@@ -133,6 +137,12 @@ func (d *daneController) recordsForHost(ctx context.Context, host string) ([]dan
 // markRetiring records the CURRENT live key's digest as retiring, with a soak
 // deadline. Must be called BEFORE the key is promoted (so "live" is still the old
 // key). Leader-only by virtue of its caller (ActivateCertificateKey).
+//
+// Idempotent by digest: re-running an activation finds its own digest already
+// retiring and leaves the deadline alone, so it cannot restart the soak the
+// operator is counting down. A DIFFERENT digest is a different rotation and is
+// added alongside, never over the top — dropping a digest the fleet is still
+// serving is the failure this marker exists to prevent.
 func (d *daneController) markRetiring(ctx context.Context, host string) error {
 	if d.backend == nil {
 		return nil
@@ -145,8 +155,26 @@ func (d *daneController) markRetiring(ctx context.Context, host string) error {
 	if err != nil {
 		return err
 	}
-	rec := dane.RetiringRecord{Digest: digest, RetireAfter: time.Now().Add(d.soak).Unix()}
-	data, _ := json.Marshal(rec)
+
+	now := time.Now()
+	kept := make([]dane.RetiringRecord, 0, 4)
+	found := false
+	for _, rec := range d.retiring(ctx, host) {
+		if rec.Expired(now) {
+			continue // pruned here rather than left to accumulate
+		}
+		if rec.Digest == digest {
+			found = true
+		}
+		kept = append(kept, rec)
+	}
+	if found {
+		return nil
+	}
+	rec := dane.RetiringRecord{Digest: digest, RetireAfter: now.Add(d.soak).Unix()}
+	kept = append(kept, rec)
+
+	data, _ := json.Marshal(kept)
 	key := dane.RetiringObjectName(d.prefix, host)
 	if err := d.backend.PutObject(ctx, key, strings.NewReader(string(data)), int64(len(data)), storage.PutOptions{ContentType: "application/json"}); err != nil {
 		return err
@@ -156,41 +184,78 @@ func (d *daneController) markRetiring(ctx context.Context, host string) error {
 	return nil
 }
 
-func (d *daneController) getRetiring(ctx context.Context, host string) (dane.RetiringRecord, bool) {
+// retiring reads a host's retiring markers, expired ones included.
+func (d *daneController) retiring(ctx context.Context, host string) []dane.RetiringRecord {
 	if d.backend == nil {
-		return dane.RetiringRecord{}, false
+		return nil
 	}
 	rc, err := d.backend.GetObject(ctx, dane.RetiringObjectName(d.prefix, host))
 	if err != nil {
-		return dane.RetiringRecord{}, false
+		return nil
 	}
 	defer rc.Close()
 	raw, err := io.ReadAll(rc)
 	if err != nil {
-		return dane.RetiringRecord{}, false
+		return nil
 	}
-	var rec dane.RetiringRecord
-	if json.Unmarshal(raw, &rec) != nil {
-		return dane.RetiringRecord{}, false
+	records, err := dane.ParseRetiring(raw)
+	if err != nil {
+		d.logger.Warn("TLS: DANE — unreadable retiring marker; treating the host as having none", "host", host, "error", err)
+		return nil
 	}
-	return rec, true
+	return records
 }
 
-// cleanupExpiredRetiring drops retiring markers whose soak has elapsed. Leader-only.
+// retiringDigest reports whether a digest is recorded and still inside its soak.
+func (d *daneController) retiringDigest(ctx context.Context, host, digest string) (dane.RetiringRecord, bool) {
+	now := time.Now()
+	for _, rec := range d.retiring(ctx, host) {
+		if rec.Digest == digest && !rec.Expired(now) {
+			return rec, true
+		}
+	}
+	return dane.RetiringRecord{}, false
+}
+
+// cleanupExpiredRetiring drops retiring digests whose soak has elapsed, and the
+// marker itself once none are left. Leader-only.
 func (d *daneController) cleanupExpiredRetiring(ctx context.Context) {
 	if d.backend == nil {
 		return
 	}
+	now := time.Now()
 	for _, host := range d.mxHosts {
-		rec, ok := d.getRetiring(ctx, host)
-		if !ok || time.Now().Unix() < rec.RetireAfter {
+		records := d.retiring(ctx, host)
+		if len(records) == 0 {
 			continue
 		}
-		if err := d.backend.RemoveObject(ctx, dane.RetiringObjectName(d.prefix, host)); err != nil {
-			d.logger.Debug("TLS: failed to clear expired retiring marker", "host", host, "error", err)
-		} else {
-			d.logger.Info("TLS: DANE — soak elapsed; retiring digest dropped (safe to remove the old TLSA record)", "host", host)
+		kept := make([]dane.RetiringRecord, 0, len(records))
+		var dropped []string
+		for _, rec := range records {
+			if rec.Expired(now) {
+				dropped = append(dropped, rec.Digest)
+				continue
+			}
+			kept = append(kept, rec)
 		}
+		if len(dropped) == 0 {
+			continue
+		}
+		key := dane.RetiringObjectName(d.prefix, host)
+		if len(kept) == 0 {
+			if err := d.backend.RemoveObject(ctx, key); err != nil {
+				d.logger.Debug("TLS: failed to clear expired retiring marker", "host", host, "error", err)
+				continue
+			}
+		} else {
+			data, _ := json.Marshal(kept)
+			if err := d.backend.PutObject(ctx, key, strings.NewReader(string(data)), int64(len(data)), storage.PutOptions{ContentType: "application/json"}); err != nil {
+				d.logger.Debug("TLS: failed to prune expired retiring digests", "host", host, "error", err)
+				continue
+			}
+		}
+		d.logger.Info("TLS: DANE — soak elapsed; retiring digest dropped (safe to remove the old TLSA record)",
+			"host", host, "digests", dropped, "still_retiring", len(kept))
 	}
 }
 

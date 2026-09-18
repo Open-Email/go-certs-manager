@@ -449,42 +449,6 @@ func (m *Manager) flushOne(ctx context.Context, domain string, p pendingPersist)
 	return true
 }
 
-// markRetiringUnlessAlreadyRecorded records the outgoing digest for the DANE
-// soak, unless this exact digest is already recorded.
-//
-// Presence alone is the wrong test. Re-running an activation is an ordinary
-// flow now that a held order is reused, and re-writing would push RetireAfter
-// forward — restarting the soak the operator is counting down. But a SECOND
-// rotation inside that window is a different thing entirely: B→C after A→B
-// finds A's marker still there, and skipping would leave B's digest
-// unpublished while nodes are still serving B-bound chains, which is a DANE
-// rejection rather than a stale record. The live key's own digest tells the
-// two apart: equal means the same ceremony again, different means a new one.
-//
-// Must be called BEFORE the key is promoted — afterwards the outgoing key is
-// gone and there is nothing left to record.
-func (m *Manager) markRetiringUnlessAlreadyRecorded(ctx context.Context, domain string) {
-	if m.dane == nil || !m.dane.isMX(domain) {
-		return
-	}
-	liveKey, err := m.keyStore.LoadCertKey(ctx, domain)
-	if err != nil {
-		m.logger.Warn("TLS: cannot read the live key to record the retiring DANE digest", "domain", domain, "error", err)
-		return
-	}
-	liveDigest, err := dane.SPKISHA256(liveKey.Public())
-	if err != nil {
-		m.logger.Warn("TLS: cannot compute the retiring DANE digest", "domain", domain, "error", err)
-		return
-	}
-	if rec, ok := m.dane.getRetiring(ctx, domain); ok && rec.Digest == liveDigest {
-		return // the same ceremony, tried again
-	}
-	if err := m.dane.markRetiring(ctx, domain); err != nil {
-		m.logger.Warn("TLS: failed to record retiring DANE digest", "domain", domain, "error", err)
-	}
-}
-
 // reconcileCeremony completes a key-replacement ceremony that was interrupted
 // after the new certificate was issued and stored but before the staged key was
 // promoted (e.g. the leader crashed or lost leadership between Store and Promote).
@@ -521,9 +485,14 @@ func (m *Manager) reconcileCeremony(ctx context.Context, domain string) {
 		// before promoting, and the storage failure that interrupted the
 		// ceremony is just as able to have taken that write with it. Recorded
 		// here while the live key is still the OLD one — after the promotion
-		// below there is nothing left to read it from. Only when absent: a
-		// second write would restart the soak window the operator is counting.
-		m.markRetiringUnlessAlreadyRecorded(ctx, domain)
+		// below there is nothing left to read it from.
+		if m.dane != nil && m.dane.isMX(domain) {
+			// Idempotent by digest, so a re-run neither restarts the soak nor
+			// displaces another rotation's still-needed digest.
+			if err := m.dane.markRetiring(ctx, domain); err != nil {
+				m.logger.Warn("TLS: failed to record retiring DANE digest", "domain", domain, "error", err)
+			}
+		}
 		if err := m.keyStore.PromoteNextCertKey(ctx, domain); err != nil {
 			m.logger.Error("TLS: failed to complete interrupted key-replacement", "domain", domain, "error", err)
 			return
@@ -704,7 +673,13 @@ func (m *Manager) ActivateCertificateKey(domain string, force bool) error {
 	// Record the OUTGOING (still-live) digest for the DANE soak window BEFORE
 	// promoting, so the operator keeps the old TLSA record published until lagging
 	// nodes converge on the new cert.
-	m.markRetiringUnlessAlreadyRecorded(ctx, domain)
+	if m.dane != nil && m.dane.isMX(domain) {
+		// Idempotent by digest, so a re-run neither restarts the soak nor
+		// displaces another rotation's still-needed digest.
+		if err := m.dane.markRetiring(ctx, domain); err != nil {
+			m.logger.Warn("TLS: failed to record retiring DANE digest", "domain", domain, "error", err)
+		}
+	}
 	if heldNotStored {
 		// The ceremony's order is as spent as any other, so hold the chain
 		// rather than lose it. The key stays STAGED: promoting against a chain

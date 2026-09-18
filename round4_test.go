@@ -3,7 +3,9 @@ package certmanager
 import (
 	"context"
 	"crypto/tls"
+	"encoding/json"
 	"errors"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -152,7 +154,7 @@ func TestReconcileCeremony_RecordsTheRetiringDigestTheInterruptionLost(t *testin
 	if err := m.ActivateCertificateKey("mx.example.com", true); !errors.Is(err, ErrOrderNotPersisted) {
 		t.Fatalf("err = %v, want ErrOrderNotPersisted", err)
 	}
-	if _, ok := m.dane.getRetiring(ctx, "mx.example.com"); ok {
+	if _, ok := soleRetiring(t, m, "mx.example.com"); ok {
 		t.Fatal("setup: the retiring record should not have survived the outage")
 	}
 
@@ -164,7 +166,7 @@ func TestReconcileCeremony_RecordsTheRetiringDigestTheInterruptionLost(t *testin
 	}
 	m.reconcileCeremony(ctx, "mx.example.com")
 
-	rec, ok := m.dane.getRetiring(ctx, "mx.example.com")
+	rec, ok := soleRetiring(t, m, "mx.example.com")
 	if !ok {
 		t.Fatal("no retiring digest recorded; the old TLSA record gets dropped with no soak")
 	}
@@ -293,7 +295,7 @@ func TestActivateCertificateKey_DoesNotRestartTheSoakOnARetry(t *testing.T) {
 	if err := m.ActivateCertificateKey("mx.example.com", true); !errors.Is(err, ErrOrderNotPersisted) {
 		t.Fatalf("first attempt: err = %v, want ErrOrderNotPersisted", err)
 	}
-	first, ok := m.dane.getRetiring(ctx, "mx.example.com")
+	first, ok := soleRetiring(t, m, "mx.example.com")
 	if !ok {
 		t.Fatal("setup: the first attempt should have recorded the retiring digest")
 	}
@@ -303,7 +305,7 @@ func TestActivateCertificateKey_DoesNotRestartTheSoakOnARetry(t *testing.T) {
 		t.Fatalf("second attempt: err = %v, want ErrOrderNotPersisted", err)
 	}
 
-	second, ok := m.dane.getRetiring(ctx, "mx.example.com")
+	second, ok := soleRetiring(t, m, "mx.example.com")
 	if !ok {
 		t.Fatal("the retiring record disappeared on the retry")
 	}
@@ -325,62 +327,70 @@ func storedChain(t *testing.T, m *Manager, host string, serial int64) *tls.Certi
 	return cert
 }
 
-// A second rotation inside the first one's soak window is not a retry. Skipping
-// the marker because A's is still there would leave B's digest unpublished
-// while nodes are still serving B-bound chains — a DANE rejection, not a stale
-// record.
-func TestActivateCertificateKey_RecordsEachRotationsOwnRetiringDigest(t *testing.T) {
+// A second rotation inside the first one's soak is not a retry, and not a
+// replacement either. A→B then B→C leaves A-bound and B-bound chains both being
+// served somewhere in the fleet, so BOTH digests have to stay published: keeping
+// only one means an operator drops a TLSA record that nodes are still
+// presenting, which is a DANE hard failure rather than a stale record.
+func TestActivateCertificateKey_KeepsEveryRotationsRetiringDigest(t *testing.T) {
 	ctx := context.Background()
 	m, _, flaky := newFlakyManager(t, 0) // storage works: both ceremonies complete
 	m.dane = newDANEController(m.keyStore, flaky.Backend, "", []string{"mx.example.com"}, 3600, 24*time.Hour, testLogger())
 
-	keyA, err := m.keyStore.LoadCertKey(ctx, "mx.example.com")
-	if err != nil {
-		t.Fatal(err)
+	digestOf := func(what string) string {
+		t.Helper()
+		k, err := m.keyStore.LoadCertKey(ctx, "mx.example.com")
+		if err != nil {
+			t.Fatalf("%s: %v", what, err)
+		}
+		d, err := dane.SPKISHA256(k.Public())
+		if err != nil {
+			t.Fatalf("%s: %v", what, err)
+		}
+		return d
 	}
-	digestA, err := dane.SPKISHA256(keyA.Public())
-	if err != nil {
-		t.Fatal(err)
+	rotate := func(what string) {
+		t.Helper()
+		if _, err := m.keyStore.GenerateNextCertKey(ctx, "mx.example.com"); err != nil {
+			t.Fatalf("%s: %v", what, err)
+		}
+		if err := m.ActivateCertificateKey("mx.example.com", true); err != nil {
+			t.Fatalf("%s: %v", what, err)
+		}
 	}
 
-	// A -> B
-	if _, err := m.keyStore.GenerateNextCertKey(ctx, "mx.example.com"); err != nil {
-		t.Fatal(err)
-	}
-	if err := m.ActivateCertificateKey("mx.example.com", true); err != nil {
-		t.Fatalf("A->B: %v", err)
-	}
-	rec, ok := m.dane.getRetiring(ctx, "mx.example.com")
-	if !ok || rec.Digest != digestA {
-		t.Fatalf("after A->B the retiring digest is %q, want A's %q", rec.Digest, digestA)
-	}
-
-	keyB, err := m.keyStore.LoadCertKey(ctx, "mx.example.com")
-	if err != nil {
-		t.Fatal(err)
-	}
-	digestB, err := dane.SPKISHA256(keyB.Public())
-	if err != nil {
-		t.Fatal(err)
-	}
+	digestA := digestOf("A")
+	rotate("A->B")
+	digestB := digestOf("B")
 	if digestB == digestA {
 		t.Fatal("setup: the key did not actually rotate")
 	}
+	rotate("B->C")
 
-	// B -> C, well inside A's soak window.
-	if _, err := m.keyStore.GenerateNextCertKey(ctx, "mx.example.com"); err != nil {
+	retiring := map[string]bool{}
+	for _, rec := range m.dane.retiring(ctx, "mx.example.com") {
+		retiring[rec.Digest] = true
+	}
+	if !retiring[digestA] {
+		t.Error("A's digest was dropped by the second rotation; nodes still serving A-bound chains lose DANE")
+	}
+	if !retiring[digestB] {
+		t.Error("B's digest was never recorded; the second rotation looked like a retry of the first")
+	}
+
+	// And both reach the records the operator is told to publish.
+	records, err := m.dane.recordsForHost(ctx, "mx.example.com")
+	if err != nil {
 		t.Fatal(err)
 	}
-	if err := m.ActivateCertificateKey("mx.example.com", true); err != nil {
-		t.Fatalf("B->C: %v", err)
+	published := map[string]bool{}
+	for _, r := range records {
+		published[r.Cert] = true
 	}
-
-	rec, ok = m.dane.getRetiring(ctx, "mx.example.com")
-	if !ok {
-		t.Fatal("no retiring record after the second rotation")
-	}
-	if rec.Digest != digestB {
-		t.Fatalf("retiring digest is %q after B->C; want B's %q — A's marker was mistaken for a retry", rec.Digest, digestB)
+	for name, digest := range map[string]string{"A": digestA, "B": digestB} {
+		if !published[digest] {
+			t.Errorf("%s's retiring digest is not in the records to publish", name)
+		}
 	}
 }
 
@@ -406,5 +416,89 @@ func TestRecordIssued_RefusesAChainStorageDoesNotHave(t *testing.T) {
 
 	if _, known := m.onDemand.indexNotAfter("vanity.example.com"); !known {
 		t.Error("recordIssued refused a chain that IS in storage")
+	}
+}
+
+// soleRetiring returns the one retiring record for a host, failing if there is
+// not exactly one — the shape most of these tests are about.
+func soleRetiring(t *testing.T, m *Manager, host string) (dane.RetiringRecord, bool) {
+	t.Helper()
+	recs := m.dane.retiring(context.Background(), host)
+	switch len(recs) {
+	case 0:
+		return dane.RetiringRecord{}, false
+	case 1:
+		return recs[0], true
+	default:
+		t.Fatalf("%d retiring records for %s, expected one: %+v", len(recs), host, recs)
+		return dane.RetiringRecord{}, false
+	}
+}
+
+// Markers written before the list existed are in flight in exactly the
+// situation that matters — mid-soak — so the old single-object form must still
+// be read, and must survive being added to.
+func TestRetiring_ReadsTheSingleObjectFormWrittenBeforeTheList(t *testing.T) {
+	ctx := context.Background()
+	m, _, flaky := newFlakyManager(t, 0)
+	m.dane = newDANEController(m.keyStore, flaky.Backend, "", []string{"mx.example.com"}, 3600, 24*time.Hour, testLogger())
+
+	legacy := `{"digest":"aaaa","retire_after":` + strconv.FormatInt(time.Now().Add(12*time.Hour).Unix(), 10) + `}`
+	key := dane.RetiringObjectName("", "mx.example.com")
+	if err := flaky.Backend.PutObject(ctx, key, strings.NewReader(legacy), int64(len(legacy)),
+		storage.PutOptions{ContentType: "application/json"}); err != nil {
+		t.Fatal(err)
+	}
+
+	recs := m.dane.retiring(ctx, "mx.example.com")
+	if len(recs) != 1 || recs[0].Digest != "aaaa" {
+		t.Fatalf("legacy marker not read back: %+v", recs)
+	}
+
+	// A rotation now adds to it rather than replacing it.
+	if _, err := m.keyStore.GenerateNextCertKey(ctx, "mx.example.com"); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.ActivateCertificateKey("mx.example.com", true); err != nil {
+		t.Fatal(err)
+	}
+
+	found := false
+	for _, rec := range m.dane.retiring(ctx, "mx.example.com") {
+		if rec.Digest == "aaaa" {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("the legacy digest was dropped by the first rotation after the upgrade")
+	}
+}
+
+// An expired digest stops being published and is pruned, while an unexpired one
+// beside it is left alone.
+func TestCleanupExpiredRetiring_PrunesOnlyWhatHasElapsed(t *testing.T) {
+	ctx := context.Background()
+	m, _, flaky := newFlakyManager(t, 0)
+	m.dane = newDANEController(m.keyStore, flaky.Backend, "", []string{"mx.example.com"}, 3600, 24*time.Hour, testLogger())
+
+	both := []dane.RetiringRecord{
+		{Digest: "expired", RetireAfter: time.Now().Add(-time.Hour).Unix()},
+		{Digest: "live", RetireAfter: time.Now().Add(time.Hour).Unix()},
+	}
+	body, err := json.Marshal(both)
+	if err != nil {
+		t.Fatal(err)
+	}
+	key := dane.RetiringObjectName("", "mx.example.com")
+	if err := flaky.Backend.PutObject(ctx, key, strings.NewReader(string(body)), int64(len(body)),
+		storage.PutOptions{ContentType: "application/json"}); err != nil {
+		t.Fatal(err)
+	}
+
+	m.dane.cleanupExpiredRetiring(ctx)
+
+	recs := m.dane.retiring(ctx, "mx.example.com")
+	if len(recs) != 1 || recs[0].Digest != "live" {
+		t.Fatalf("after cleanup: %+v, want only the unexpired digest", recs)
 	}
 }
