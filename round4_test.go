@@ -2,6 +2,7 @@ package certmanager
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"strings"
 	"testing"
@@ -311,5 +312,99 @@ func TestActivateCertificateKey_DoesNotRestartTheSoakOnARetry(t *testing.T) {
 	}
 	if second.Digest != first.Digest {
 		t.Errorf("retiring digest changed from %s to %s", first.Digest, second.Digest)
+	}
+}
+
+// storedChain puts a certificate for host into both storage and memory, the
+// state announcement is allowed from.
+func storedChain(t *testing.T, m *Manager, host string, serial int64) *tls.Certificate {
+	t.Helper()
+	cert := holdChain(t, m, host, serial)
+	storeHeldChain(t, m, host)
+	m.certCache.dropPending(host)
+	return cert
+}
+
+// A second rotation inside the first one's soak window is not a retry. Skipping
+// the marker because A's is still there would leave B's digest unpublished
+// while nodes are still serving B-bound chains — a DANE rejection, not a stale
+// record.
+func TestActivateCertificateKey_RecordsEachRotationsOwnRetiringDigest(t *testing.T) {
+	ctx := context.Background()
+	m, _, flaky := newFlakyManager(t, 0) // storage works: both ceremonies complete
+	m.dane = newDANEController(m.keyStore, flaky.Backend, "", []string{"mx.example.com"}, 3600, 24*time.Hour, testLogger())
+
+	keyA, err := m.keyStore.LoadCertKey(ctx, "mx.example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	digestA, err := dane.SPKISHA256(keyA.Public())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// A -> B
+	if _, err := m.keyStore.GenerateNextCertKey(ctx, "mx.example.com"); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.ActivateCertificateKey("mx.example.com", true); err != nil {
+		t.Fatalf("A->B: %v", err)
+	}
+	rec, ok := m.dane.getRetiring(ctx, "mx.example.com")
+	if !ok || rec.Digest != digestA {
+		t.Fatalf("after A->B the retiring digest is %q, want A's %q", rec.Digest, digestA)
+	}
+
+	keyB, err := m.keyStore.LoadCertKey(ctx, "mx.example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	digestB, err := dane.SPKISHA256(keyB.Public())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if digestB == digestA {
+		t.Fatal("setup: the key did not actually rotate")
+	}
+
+	// B -> C, well inside A's soak window.
+	if _, err := m.keyStore.GenerateNextCertKey(ctx, "mx.example.com"); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.ActivateCertificateKey("mx.example.com", true); err != nil {
+		t.Fatalf("B->C: %v", err)
+	}
+
+	rec, ok = m.dane.getRetiring(ctx, "mx.example.com")
+	if !ok {
+		t.Fatal("no retiring record after the second rotation")
+	}
+	if rec.Digest != digestB {
+		t.Fatalf("retiring digest is %q after B->C; want B's %q — A's marker was mistaken for a retry", rec.Digest, digestB)
+	}
+}
+
+// The guard belongs to the publish path itself, not to its callers: there are
+// several, and the one that forgot is how this was found.
+func TestRecordIssued_RefusesAChainStorageDoesNotHave(t *testing.T) {
+	fs, err := storage.NewFilesystemBackend(t.TempDir(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := onDemandLeader(t, fs, &countingCA{}, "vanity.example.com")
+	holdChain(t, m, "vanity.example.com", 81) // memory only
+
+	m.recordIssued(context.Background(), "vanity.example.com")
+
+	if _, known := m.onDemand.indexNotAfter("vanity.example.com"); known {
+		t.Fatal("recordIssued published a chain that is not in storage")
+	}
+
+	storeHeldChain(t, m, "vanity.example.com")
+	m.certCache.dropPending("vanity.example.com")
+	m.recordIssued(context.Background(), "vanity.example.com")
+
+	if _, known := m.onDemand.indexNotAfter("vanity.example.com"); !known {
+		t.Error("recordIssued refused a chain that IS in storage")
 	}
 }

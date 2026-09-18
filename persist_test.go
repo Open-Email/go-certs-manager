@@ -369,7 +369,7 @@ func TestAnnounceStoredChains_PublishesALateOnDemandWrite(t *testing.T) {
 	ctx := context.Background()
 	m := newOnDemandManager(t, backend, true, OnDemandConfig{})
 
-	cert := holdChain(t, m, "vanity.example.com", 7)
+	cert := storedChain(t, m, "vanity.example.com", 7)
 
 	if _, known := m.onDemand.indexNotAfter("vanity.example.com"); known {
 		t.Fatal("index already knows the hostname before the announcement")
@@ -397,14 +397,14 @@ func TestAnnounceStoredChains_LeaderOnlyAndDynamicOnly(t *testing.T) {
 	// Both managers must actually HOLD the certificate, or the announcement
 	// would be skipped for want of one and the guards under test never reached.
 	follower := newOnDemandManager(t, backend, false, OnDemandConfig{})
-	holdChain(t, follower, "vanity.example.com", 11)
+	storedChain(t, follower, "vanity.example.com", 11)
 	follower.announceStoredChains(ctx, false, []string{"vanity.example.com"})
 	if _, known := follower.onDemand.indexNotAfter("vanity.example.com"); known {
 		t.Error("a follower published to the shared on-demand index")
 	}
 
 	leader := newOnDemandManager(t, backend, true, OnDemandConfig{})
-	holdChain(t, leader, "mx.example.com", 12)
+	storedChain(t, leader, "mx.example.com", 12)
 	leader.announceStoredChains(ctx, true, []string{"mx.example.com"}) // static
 	if _, known := leader.onDemand.indexNotAfter("mx.example.com"); known {
 		t.Error("a static domain was written into the on-demand index")
@@ -738,7 +738,7 @@ func TestRecordIssued_SaysWhenItCannotPublish(t *testing.T) {
 		domainSet: map[string]bool{},
 	}
 	m.onDemand = newOnDemand(OnDemandConfig{}, backend, "")
-	holdChain(t, m, "vanity.example.com", 41)
+	storedChain(t, m, "vanity.example.com", 41)
 
 	m.recordIssued(context.Background(), "vanity.example.com")
 

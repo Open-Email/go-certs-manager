@@ -191,13 +191,7 @@ func (m *Manager) maintainOnDemand(leader bool) {
 			// them would ever reach the announcement at the end of a run, and
 			// the hostname would stay invisible to every follower until it
 			// expired. Say it now — the leader is the only one who may.
-			// Held but unstored is exactly what must NOT be announced: the
-			// index says what storage holds, and a follower that believed this
-			// entry would adopt the older chain still in storage, record itself
-			// current at the announced expiry, and never see a difference again
-			// when the real write finally lands. The flush announces it, once
-			// storage actually has it.
-			if !known && !m.certCache.isPending(host) {
+			if !known {
 				m.recordIssued(loadCtx, host)
 			}
 			continue
@@ -330,6 +324,15 @@ func (m *Manager) recordIssued(ctx context.Context, host string) {
 	if m.onDemand == nil {
 		return
 	}
+	// The index describes STORAGE. A chain still held in memory is the one
+	// entry it must never carry: a follower believing it adopts the older chain
+	// actually there, records itself current at the expiry we announced, and
+	// then sees no difference when the real write lands on that same value.
+	// Guarded here rather than at the callers, because there are several and
+	// the one that forgot is how this was found.
+	if m.certCache.isPending(host) {
+		return
+	}
 	notAfter, ok := m.certCache.leafNotAfter(host)
 	if !ok {
 		return
@@ -446,6 +449,42 @@ func (m *Manager) flushOne(ctx context.Context, domain string, p pendingPersist)
 	return true
 }
 
+// markRetiringUnlessAlreadyRecorded records the outgoing digest for the DANE
+// soak, unless this exact digest is already recorded.
+//
+// Presence alone is the wrong test. Re-running an activation is an ordinary
+// flow now that a held order is reused, and re-writing would push RetireAfter
+// forward — restarting the soak the operator is counting down. But a SECOND
+// rotation inside that window is a different thing entirely: B→C after A→B
+// finds A's marker still there, and skipping would leave B's digest
+// unpublished while nodes are still serving B-bound chains, which is a DANE
+// rejection rather than a stale record. The live key's own digest tells the
+// two apart: equal means the same ceremony again, different means a new one.
+//
+// Must be called BEFORE the key is promoted — afterwards the outgoing key is
+// gone and there is nothing left to record.
+func (m *Manager) markRetiringUnlessAlreadyRecorded(ctx context.Context, domain string) {
+	if m.dane == nil || !m.dane.isMX(domain) {
+		return
+	}
+	liveKey, err := m.keyStore.LoadCertKey(ctx, domain)
+	if err != nil {
+		m.logger.Warn("TLS: cannot read the live key to record the retiring DANE digest", "domain", domain, "error", err)
+		return
+	}
+	liveDigest, err := dane.SPKISHA256(liveKey.Public())
+	if err != nil {
+		m.logger.Warn("TLS: cannot compute the retiring DANE digest", "domain", domain, "error", err)
+		return
+	}
+	if rec, ok := m.dane.getRetiring(ctx, domain); ok && rec.Digest == liveDigest {
+		return // the same ceremony, tried again
+	}
+	if err := m.dane.markRetiring(ctx, domain); err != nil {
+		m.logger.Warn("TLS: failed to record retiring DANE digest", "domain", domain, "error", err)
+	}
+}
+
 // reconcileCeremony completes a key-replacement ceremony that was interrupted
 // after the new certificate was issued and stored but before the staged key was
 // promoted (e.g. the leader crashed or lost leadership between Store and Promote).
@@ -484,13 +523,7 @@ func (m *Manager) reconcileCeremony(ctx context.Context, domain string) {
 		// here while the live key is still the OLD one — after the promotion
 		// below there is nothing left to read it from. Only when absent: a
 		// second write would restart the soak window the operator is counting.
-		if m.dane != nil && m.dane.isMX(domain) {
-			if _, ok := m.dane.getRetiring(ctx, domain); !ok {
-				if err := m.dane.markRetiring(ctx, domain); err != nil {
-					m.logger.Warn("TLS: failed to record retiring DANE digest while completing the ceremony", "domain", domain, "error", err)
-				}
-			}
-		}
+		m.markRetiringUnlessAlreadyRecorded(ctx, domain)
 		if err := m.keyStore.PromoteNextCertKey(ctx, domain); err != nil {
 			m.logger.Error("TLS: failed to complete interrupted key-replacement", "domain", domain, "error", err)
 			return
@@ -671,17 +704,7 @@ func (m *Manager) ActivateCertificateKey(domain string, force bool) error {
 	// Record the OUTGOING (still-live) digest for the DANE soak window BEFORE
 	// promoting, so the operator keeps the old TLSA record published until lagging
 	// nodes converge on the new cert.
-	// Only when absent. Re-running an activation is an ordinary flow now that a
-	// held order is reused, and a second write would push RetireAfter forward —
-	// restarting the soak the operator is counting down, on a digest that has
-	// been retiring since the first attempt.
-	if m.dane != nil && m.dane.isMX(domain) {
-		if _, recorded := m.dane.getRetiring(ctx, domain); !recorded {
-			if err := m.dane.markRetiring(ctx, domain); err != nil {
-				m.logger.Warn("TLS: failed to record retiring DANE digest", "domain", domain, "error", err)
-			}
-		}
-	}
+	m.markRetiringUnlessAlreadyRecorded(ctx, domain)
 	if heldNotStored {
 		// The ceremony's order is as spent as any other, so hold the chain
 		// rather than lose it. The key stays STAGED: promoting against a chain
