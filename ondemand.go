@@ -131,6 +131,12 @@ type onDemand struct {
 	// `mu` because it is held across I/O and `mu` must never be.
 	indexMu sync.Mutex
 
+	// indexDirty says the in-memory index holds something the published one
+	// does not, because a write failed. Without it a single dropped PUT leaves
+	// followers blind to a hostname until some unrelated issuance happens to
+	// republish the map — days, on a quiet fleet.
+	indexDirty atomic.Bool
+
 	// resolveFn is the pre-flight's resolution decision, injectable for tests
 	// (it returns "" when the hostname points at the target, else why not).
 	resolveFn func(ctx context.Context, hostname, target string) string
@@ -329,10 +335,20 @@ func (o *onDemand) noteIssued(ctx context.Context, hostname string, notAfter tim
 	if o.index == nil {
 		o.index = make(map[string]int64)
 	}
-	// The FULL map, never a single entry: a follower diffing an index that held
-	// only the last write would read every other hostname as missing and fall
-	// back to the per-host storage reads this exists to avoid.
 	o.index[strings.ToLower(hostname)] = notAfter.Unix()
+	o.mu.Unlock()
+
+	return o.publishIndex(ctx)
+}
+
+// publishIndex writes the in-memory index, recording whether the published copy
+// is now behind it. Callers hold indexMu.
+//
+// The FULL map, never a single entry: a follower diffing an index that held
+// only the last write would read every other hostname as missing and fall back
+// to the per-host storage reads this exists to avoid.
+func (o *onDemand) publishIndex(ctx context.Context) error {
+	o.mu.Lock()
 	snapshot := make(map[string]int64, len(o.index))
 	for k, v := range o.index {
 		snapshot[k] = v
@@ -341,10 +357,35 @@ func (o *onDemand) noteIssued(ctx context.Context, hostname string, notAfter tim
 
 	body, err := json.Marshal(snapshot)
 	if err != nil {
+		o.indexDirty.Store(true)
 		return err
 	}
-	return o.backend.PutObject(ctx, o.key(certIndexKey), bytes.NewReader(body),
-		int64(len(body)), storage.PutOptions{ContentType: "application/json"})
+	if err := o.backend.PutObject(ctx, o.key(certIndexKey), bytes.NewReader(body),
+		int64(len(body)), storage.PutOptions{ContentType: "application/json"}); err != nil {
+		o.indexDirty.Store(true)
+		return err
+	}
+	o.indexDirty.Store(false)
+	return nil
+}
+
+// republishIndexIfDirty retries a publication that failed earlier. Cheap when
+// nothing is owed: one atomic read.
+//
+// The alternative was to wait for the next hostname to publish, which on a
+// fleet with no on-demand churn is not a bound at all — one dropped PUT would
+// keep followers from refreshing a hostname for as long as nothing else was
+// issued.
+func (o *onDemand) republishIndexIfDirty(ctx context.Context) error {
+	if !o.indexDirty.Load() {
+		return nil
+	}
+	o.indexMu.Lock()
+	defer o.indexMu.Unlock()
+	if !o.indexDirty.Load() {
+		return nil
+	}
+	return o.publishIndex(ctx)
 }
 
 // hydrateIndex seeds the in-memory expiry map from the published one.

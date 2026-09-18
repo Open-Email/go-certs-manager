@@ -18,6 +18,27 @@ import (
 //     (always reusing the persistent key, so the SPKI never changes)
 //   - on followers: refresh certs from storage so they serve what the leader issued
 //
+// tickContext is a deadline that also dies with the manager. Stop() waits ten
+// seconds; without this, work started on a tick would keep talking to storage —
+// taking and releasing issuance leases — for minutes after the process was told
+// to go, and outlive the wait meant to bound it.
+func (m *Manager) tickContext(timeout time.Duration) (context.Context, context.CancelFunc) {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	if m.stopCh == nil {
+		return ctx, cancel
+	}
+	// The goroutine ends with the context either way, so it cannot outlive the
+	// work it is guarding.
+	go func() {
+		select {
+		case <-m.stopCh:
+			cancel()
+		case <-ctx.Done():
+		}
+	}()
+	return ctx, cancel
+}
+
 // flushTimeout bounds one pass over the held chains. Generous enough for a
 // sizeable backlog at one write each, short enough that it cannot become the
 // tick.
@@ -47,7 +68,7 @@ func (m *Manager) maintainOnce() {
 	// Held chains first, on their OWN budget. Sharing the tick's context would
 	// let a storage outage — the only way chains pile up — eat the deadline that
 	// the renewals and the follower refresh below depend on.
-	flushCtx, cancelFlush := context.WithTimeout(context.Background(), flushTimeout)
+	flushCtx, cancelFlush := m.tickContext(flushTimeout)
 	stored := m.flushHeldChains(flushCtx)
 	cancelFlush()
 
@@ -56,22 +77,31 @@ func (m *Manager) maintainOnce() {
 	// whether this node may publish to the shared index at all.
 	leader := m.isLeader()
 
-	ctx, cancel := context.WithTimeout(context.Background(), issueTimeout+30*time.Second)
+	ctx, cancel := m.tickContext(issueTimeout + 30*time.Second)
 	defer cancel()
 
 	m.announceStoredChains(ctx, leader, stored)
 
+	// One deadline PER DOMAIN, not one across all of them. Under a shared
+	// deadline a slow first domain leaves the last with seconds, and every
+	// "context deadline exceeded" it then reports is charged to that domain's
+	// retry budget for a problem that was ours — the same reasoning the
+	// on-demand loop below was already built on.
 	for _, domain := range m.domains {
-		if leader {
-			m.reconcileCeremony(ctx, domain)
-			if err := m.renewIfNeeded(ctx, domain); err != nil {
-				m.logger.Warn("TLS: maintenance issue/renew failed", "domain", domain, "error", err)
+		func() {
+			dctx, dcancel := m.tickContext(issueTimeout)
+			defer dcancel()
+			if leader {
+				m.reconcileCeremony(dctx, domain)
+				if err := m.renewIfNeeded(dctx, domain); err != nil {
+					m.logger.Warn("TLS: maintenance issue/renew failed", "domain", domain, "error", err)
+				}
+				return
 			}
-		} else {
-			if _, err := m.certCache.Refresh(ctx, domain); err != nil {
+			if _, err := m.certCache.Refresh(dctx, domain); err != nil {
 				m.logger.Debug("TLS: follower refresh found no certificate yet", "domain", domain, "error", err)
 			}
-		}
+		}()
 	}
 
 	// Drift alarm: leader-only so a mismatch alerts once, not once per node.
@@ -138,11 +168,28 @@ func (m *Manager) maintainOnDemand(leader bool) {
 	// of it for free; only hostnames it does not cover cost a storage read, and
 	// only until they are in memory.
 	loadCtx, loadCancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	// A publication that failed earlier is owed before anything else: until it
+	// lands, every hostname it covers is one no follower will refresh.
+	if err := m.onDemand.republishIndexIfDirty(loadCtx); err != nil {
+		m.logger.Warn("TLS: could not republish the on-demand index", "error", err)
+	}
 	for _, host := range hosts {
-		if _, have := m.certCache.leafNotAfter(host); have {
+		_, have := m.certCache.leafNotAfter(host)
+		_, known := m.onDemand.indexNotAfter(host)
+		if have {
+			// Holding a certificate the index does not name. Three ways in: a
+			// flush that adopted a chain already in storage, a handshake that
+			// loaded one, or a node that stored a chain while demoted and could
+			// not announce it. None of them pass through issuance, so none of
+			// them would ever reach the announcement at the end of a run, and
+			// the hostname would stay invisible to every follower until it
+			// expired. Say it now — the leader is the only one who may.
+			if !known {
+				m.recordIssued(loadCtx, host)
+			}
 			continue
 		}
-		if _, known := m.onDemand.indexNotAfter(host); !known {
+		if !known {
 			continue
 		}
 		if _, err := m.certCache.Refresh(loadCtx, host); err != nil {
@@ -377,6 +424,11 @@ func (m *Manager) flushOne(ctx context.Context, domain string, p pendingPersist)
 		return false
 	}
 	m.logger.Info("TLS: stored a chain that had been held in memory since issuance", "domain", domain)
+	// The attempts that failed were charged to the retry budget to stop an
+	// automatic re-order; the chain is stored now, so leaving the domain
+	// throttled for the rest of the hour would punish it for a problem that is
+	// over.
+	m.retries.reset(domain)
 	m.certCache.dropPending(domain)
 	return true
 }
@@ -413,6 +465,19 @@ func (m *Manager) reconcileCeremony(ctx context.Context, domain string) {
 	// Stored cert is bound to the staged next key, but the live key wasn't promoted.
 	if leafSPKI == nextSPKI && liveSPKI != nextSPKI {
 		m.logger.Warn("TLS: completing interrupted key-replacement (promoting staged key)", "domain", domain)
+		// The soak record may be missing: ActivateCertificateKey writes it just
+		// before promoting, and the storage failure that interrupted the
+		// ceremony is just as able to have taken that write with it. Recorded
+		// here while the live key is still the OLD one — after the promotion
+		// below there is nothing left to read it from. Only when absent: a
+		// second write would restart the soak window the operator is counting.
+		if m.dane != nil && m.dane.isMX(domain) {
+			if _, ok := m.dane.getRetiring(ctx, domain); !ok {
+				if err := m.dane.markRetiring(ctx, domain); err != nil {
+					m.logger.Warn("TLS: failed to record retiring DANE digest while completing the ceremony", "domain", domain, "error", err)
+				}
+			}
+		}
 		if err := m.keyStore.PromoteNextCertKey(ctx, domain); err != nil {
 			m.logger.Error("TLS: failed to complete interrupted key-replacement", "domain", domain, "error", err)
 			return
@@ -566,13 +631,22 @@ func (m *Manager) ActivateCertificateKey(domain string, force bool) error {
 		}
 	}
 
-	issuer, err := m.ensureIssuer(ctx)
-	if err != nil {
-		return err
-	}
-	chainPEM, err := issuer.Issue(ctx, domain, nextKey)
-	if err != nil {
-		return fmt.Errorf("issue cert with next key for %s: %w", domain, err)
+	// An earlier attempt may have got a chain from the CA and failed to store
+	// it. Re-ordering here is what an operator re-running the command after a
+	// storage failure would cause, and the CA charges for it either way — five
+	// duplicates a week is not many to spend on the same key twice.
+	chainPEM, held, reused := m.certCache.heldChainFor(domain, nextKey)
+	if reused {
+		m.logger.Warn("TLS: reusing the certificate a previous activation ordered but could not store", "domain", domain, "not_after", held.Leaf.NotAfter)
+	} else {
+		issuer, ierr := m.ensureIssuer(ctx)
+		if ierr != nil {
+			return ierr
+		}
+		chainPEM, err = issuer.Issue(ctx, domain, nextKey)
+		if err != nil {
+			return fmt.Errorf("issue cert with next key for %s: %w", domain, err)
+		}
 	}
 	// Serve the new cert (bound to the next key) before promoting, so storage and
 	// the live key converge; PromoteNextCertKey then makes keyFor match the chain.

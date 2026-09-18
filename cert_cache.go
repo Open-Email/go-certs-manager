@@ -177,6 +177,25 @@ func (c *certCache) pendingDomains() []string {
 	return out
 }
 
+// heldChainFor returns a held chain for domain that is bound to key, if there is
+// one. Lets a caller reuse an order it already paid for instead of placing a
+// second one for the same key.
+func (c *certCache) heldChainFor(domain string, key crypto.Signer) ([]byte, *tls.Certificate, bool) {
+	c.pendingMu.Lock()
+	p, ok := c.pending[strings.ToLower(domain)]
+	c.pendingMu.Unlock()
+	if !ok {
+		return nil, nil, false
+	}
+	// Built against the key the caller means to use: that is what proves the
+	// held chain is this ceremony's and not an ordinary renewal's.
+	cert, err := buildCertificate(p.chainPEM, key)
+	if err != nil {
+		return nil, nil, false
+	}
+	return p.chainPEM, cert, true
+}
+
 // pendingSnapshot copies the held chains so the caller can work through them
 // without holding the lock across storage calls.
 func (c *certCache) pendingSnapshot() map[string]pendingPersist {
