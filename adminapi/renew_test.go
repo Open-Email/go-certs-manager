@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -227,16 +228,54 @@ func TestRenewHandler_RequestShape(t *testing.T) {
 	}
 }
 
-// A request that got no answer is not a retryable failure: the order may be
-// running. It must carry the never-retry exit code.
-func TestRenewTransportFailure_IsNeverRetryable(t *testing.T) {
-	lines, exit := RenewTransportFailure(errors.New("context deadline exceeded"))
+// A request that was sent and got no answer is not a retryable failure: the
+// order may be running. This one really is sent — the server accepts it and
+// never answers inside the client's deadline.
+func TestRenewTransportFailure_SentButUnansweredIsNeverRetryable(t *testing.T) {
+	release := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		<-release
+	}))
+	defer srv.Close()
+	defer close(release)
+
+	client := &http.Client{Timeout: 200 * time.Millisecond}
+	_, err := client.Post(srv.URL+"?domain=mx.example.com", "application/json", nil)
+	if err == nil {
+		t.Fatal("setup: expected the client to time out")
+	}
+
+	lines, exit := RenewTransportFailure(err)
 	if exit != ExitStored {
-		t.Fatalf("exit = %d, want %d — a timeout must not look retryable", exit, ExitStored)
+		t.Fatalf("exit = %d, want %d — a request that may have ordered must not look retryable", exit, ExitStored)
 	}
 	out := strings.Join(lines, "\n")
 	if !strings.Contains(out, "DO NOT re-run") || !strings.Contains(out, "unknown") {
 		t.Errorf("does not say the outcome is unknown and forbid re-running:\n%s", out)
+	}
+}
+
+// A connection that was never made ordered nothing. Warning the operator off a
+// retry here would be wrong, and would wear down the warning that matters.
+func TestRenewTransportFailure_RefusedConnectionIsSafeToRetry(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr := ln.Addr().String()
+	ln.Close() // nothing listens here now
+
+	_, err = http.Post("http://"+addr+"/?domain=mx.example.com", "application/json", nil)
+	if err == nil {
+		t.Fatal("setup: expected the connection to be refused")
+	}
+
+	lines, exit := RenewTransportFailure(err)
+	if exit != ExitFailed {
+		t.Fatalf("exit = %d, want %d — nothing was sent, so retrying is right", exit, ExitFailed)
+	}
+	if out := strings.Join(lines, "\n"); !strings.Contains(out, "nothing was ordered") {
+		t.Errorf("does not say nothing was ordered:\n%s", out)
 	}
 }
 

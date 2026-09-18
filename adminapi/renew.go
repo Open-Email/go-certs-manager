@@ -16,6 +16,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"strings"
 	"time"
@@ -165,11 +166,24 @@ func RenewHandler(renewer func() Renewer, logger *slog.Logger) http.Handler {
 
 // RenewTransportFailure is the outcome when the request got no answer.
 //
-// That is NOT a failure a CLI may call retryable. The request may have reached
-// the service and the order may be under way — a client that timed out has no
-// way to know — so the only safe instruction is the spent-order one: do not
-// re-run, look first. It shares the "stored" exit code for the same reason.
+// Two different things, told apart by whether the connection was ever made:
+//
+//   - The dial failed — refused, no such host, unreachable. Nothing was sent,
+//     so nothing was ordered, and running it again is exactly right. Calling
+//     this "unknown" would teach operators to ignore the warning that matters.
+//   - Anything after that — a timeout waiting for the answer, a connection
+//     reset mid-response. The request may have arrived and the order may be
+//     under way; a client that gave up has no way to know. The only safe
+//     instruction is the spent-order one, with its exit code.
 func RenewTransportFailure(err error) ([]string, int) {
+	var opErr *net.OpError
+	if errors.As(err, &opErr) && opErr.Op == "dial" {
+		return []string{
+			"✗ Could not reach the service — nothing was ordered",
+			"  " + err.Error(),
+			"  Check that it is running and the URL is right, then run it again.",
+		}, ExitFailed
+	}
 	return []string{
 		"⚠ No answer from the service — the outcome is unknown",
 		"  " + err.Error(),
