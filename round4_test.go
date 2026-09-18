@@ -368,7 +368,7 @@ func TestActivateCertificateKey_KeepsEveryRotationsRetiringDigest(t *testing.T) 
 	rotate("B->C")
 
 	retiring := map[string]bool{}
-	for _, rec := range m.dane.retiring(ctx, "mx.example.com") {
+	for _, rec := range mustRetiring(t, m, "mx.example.com") {
 		retiring[rec.Digest] = true
 	}
 	if !retiring[digestA] {
@@ -423,7 +423,10 @@ func TestRecordIssued_RefusesAChainStorageDoesNotHave(t *testing.T) {
 // not exactly one — the shape most of these tests are about.
 func soleRetiring(t *testing.T, m *Manager, host string) (dane.RetiringRecord, bool) {
 	t.Helper()
-	recs := m.dane.retiring(context.Background(), host)
+	recs, err := m.dane.retiring(context.Background(), host)
+	if err != nil {
+		t.Fatal(err)
+	}
 	switch len(recs) {
 	case 0:
 		return dane.RetiringRecord{}, false
@@ -450,7 +453,7 @@ func TestRetiring_ReadsTheSingleObjectFormWrittenBeforeTheList(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	recs := m.dane.retiring(ctx, "mx.example.com")
+	recs := mustRetiring(t, m, "mx.example.com")
 	if len(recs) != 1 || recs[0].Digest != "aaaa" {
 		t.Fatalf("legacy marker not read back: %+v", recs)
 	}
@@ -464,7 +467,7 @@ func TestRetiring_ReadsTheSingleObjectFormWrittenBeforeTheList(t *testing.T) {
 	}
 
 	found := false
-	for _, rec := range m.dane.retiring(ctx, "mx.example.com") {
+	for _, rec := range mustRetiring(t, m, "mx.example.com") {
 		if rec.Digest == "aaaa" {
 			found = true
 		}
@@ -497,8 +500,118 @@ func TestCleanupExpiredRetiring_PrunesOnlyWhatHasElapsed(t *testing.T) {
 
 	m.dane.cleanupExpiredRetiring(ctx)
 
-	recs := m.dane.retiring(ctx, "mx.example.com")
+	recs := mustRetiring(t, m, "mx.example.com")
 	if len(recs) != 1 || recs[0].Digest != "live" {
 		t.Fatalf("after cleanup: %+v, want only the unexpired digest", recs)
+	}
+}
+
+// mustRetiring reads a host's retiring markers, failing the test on a read error.
+func mustRetiring(t *testing.T, m *Manager, host string) []dane.RetiringRecord {
+	t.Helper()
+	recs, err := m.dane.retiring(context.Background(), host)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return recs
+}
+
+// A read that failed is not a host with no markers. Rebuilding the list from
+// "nothing" would erase every digest recorded so far, which is the DANE hard
+// failure the marker exists to prevent.
+func TestMarkRetiring_RefusesToWriteWhenItCannotReadWhatIsThere(t *testing.T) {
+	ctx := context.Background()
+	m, _, flaky := newFlakyManager(t, 0)
+	blind := &readErrorBackend{Backend: flaky.Backend, failGetFor: "dane/retiring/"}
+	m.dane = newDANEController(m.keyStore, blind, "", []string{"mx.example.com"}, 3600, 24*time.Hour, testLogger())
+
+	// Something is already retiring.
+	existing := []dane.RetiringRecord{
+		{Digest: "aaaa", RetireAfter: time.Now().Add(12 * time.Hour).Unix()},
+		{Digest: "bbbb", RetireAfter: time.Now().Add(12 * time.Hour).Unix()},
+	}
+	body, err := json.Marshal(existing)
+	if err != nil {
+		t.Fatal(err)
+	}
+	key := dane.RetiringObjectName("", "mx.example.com")
+	if err := flaky.Backend.PutObject(ctx, key, strings.NewReader(string(body)), int64(len(body)),
+		storage.PutOptions{ContentType: "application/json"}); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := m.dane.markRetiring(ctx, "mx.example.com"); err == nil {
+		t.Fatal("markRetiring reported success though it could not read the existing markers")
+	}
+	if blind.puts != 0 {
+		t.Fatalf("%d write(s) while the read was failing, want 0", blind.puts)
+	}
+
+	// Nothing was lost: a reader that can see storage still finds both.
+	readable := newDANEController(m.keyStore, flaky.Backend, "", []string{"mx.example.com"}, 3600, 24*time.Hour, testLogger())
+	recs, err := readable.retiring(ctx, "mx.example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(recs) != 2 {
+		t.Fatalf("%d marker(s) survived, want 2: %+v", len(recs), recs)
+	}
+}
+
+// The records the operator is told to publish must never quietly omit a
+// retiring digest because storage would not answer.
+func TestRecordsForHost_FailsRatherThanOmitUnreadableRetiringDigests(t *testing.T) {
+	ctx := context.Background()
+	m, _, flaky := newFlakyManager(t, 0)
+	blind := &readErrorBackend{Backend: flaky.Backend, failGetFor: "dane/retiring/"}
+	m.dane = newDANEController(m.keyStore, blind, "", []string{"mx.example.com"}, 3600, 24*time.Hour, testLogger())
+
+	if _, err := m.dane.recordsForHost(ctx, "mx.example.com"); err == nil {
+		t.Fatal("recordsForHost answered as though there were no retiring digests")
+	}
+}
+
+// One digest keeps the shape a node on an older pin can read; the array appears
+// only when the state genuinely needs it.
+func TestMarshalRetiring_StaysReadableToOlderNodesWhileItCan(t *testing.T) {
+	one := []dane.RetiringRecord{{Digest: "aaaa", RetireAfter: 123}}
+	body, err := dane.MarshalRetiring(one)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(strings.TrimSpace(string(body)), "{") {
+		t.Fatalf("a single digest was written as %s; a node on an older pin cannot read that", body)
+	}
+	var legacy dane.RetiringRecord
+	if err := json.Unmarshal(body, &legacy); err != nil || legacy.Digest != "aaaa" {
+		t.Fatalf("an older reader cannot parse it: %v (%s)", err, body)
+	}
+
+	two := append(one, dane.RetiringRecord{Digest: "bbbb", RetireAfter: 456})
+	body, err = dane.MarshalRetiring(two)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(strings.TrimSpace(string(body)), "[") {
+		t.Fatalf("two digests must use the list form, got %s", body)
+	}
+	back, err := dane.ParseRetiring(body)
+	if err != nil || len(back) != 2 {
+		t.Fatalf("round trip lost entries: %+v (%v)", back, err)
+	}
+}
+
+// An entry with no digest would become a malformed "3 1 1 " record and a drift
+// warning that never clears.
+func TestParseRetiring_DropsEntriesWithNoDigest(t *testing.T) {
+	recs, err := dane.ParseRetiring([]byte(`[{"digest":"","retire_after":1},{"digest":"aaaa","retire_after":2}]`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(recs) != 1 || recs[0].Digest != "aaaa" {
+		t.Fatalf("got %+v, want only the entry with a digest", recs)
+	}
+	if recs, err := dane.ParseRetiring([]byte(`{"digest":"","retire_after":1}`)); err != nil || len(recs) != 0 {
+		t.Fatalf("got %+v (%v), want none", recs, err)
 	}
 }

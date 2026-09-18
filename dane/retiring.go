@@ -27,21 +27,39 @@ func (r RetiringRecord) Expired(now time.Time) bool { return now.Unix() >= r.Ret
 // dropped would be an operator removing a TLSA record that nodes were still
 // presenting — a DANE hard failure rather than a stale record.
 //
-// The single-object form is still read, because markers written before this
-// change are in flight in exactly the situation that matters: mid-soak.
+// Both forms are read. Entries with no digest are dropped: an empty one would
+// become a malformed "3 1 1 " record and a drift warning that never clears.
 func ParseRetiring(raw []byte) ([]RetiringRecord, error) {
 	var list []RetiringRecord
-	if err := json.Unmarshal(raw, &list); err == nil {
-		return list, nil
+	if err := json.Unmarshal(raw, &list); err != nil {
+		var one RetiringRecord
+		if err := json.Unmarshal(raw, &one); err != nil {
+			return nil, err
+		}
+		list = []RetiringRecord{one}
 	}
-	var one RetiringRecord
-	if err := json.Unmarshal(raw, &one); err != nil {
-		return nil, err
+	out := make([]RetiringRecord, 0, len(list))
+	for _, rec := range list {
+		if rec.Digest != "" {
+			out = append(out, rec)
+		}
 	}
-	if one.Digest == "" {
-		return nil, nil
+	return out, nil
+}
+
+// MarshalRetiring writes the marker in the oldest form that can carry it: a
+// single digest stays a bare object, which readers from before the list existed
+// still understand.
+//
+// The fleet is not upgraded all at once, and a node on an older pin that meets
+// an array reads no markers at all — then its own next write replaces them.
+// Degrading only where the old shape genuinely cannot express the state (more
+// than one rotation in flight) keeps the ordinary case safe across a rollout.
+func MarshalRetiring(records []RetiringRecord) ([]byte, error) {
+	if len(records) == 1 {
+		return json.Marshal(records[0])
 	}
-	return []RetiringRecord{one}, nil
+	return json.Marshal(records)
 }
 
 // RetiringObjectName returns the storage key for a host's retiring-digest marker,

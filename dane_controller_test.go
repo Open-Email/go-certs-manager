@@ -143,7 +143,7 @@ func TestDANEController_RetiringSoak(t *testing.T) {
 
 	// Leader cleanup removes the expired marker.
 	ctl.cleanupExpiredRetiring(ctx)
-	if recs := ctl.retiring(ctx, "mx.example.com"); len(recs) != 0 {
+	if recs, _ := ctl.retiring(ctx, "mx.example.com"); len(recs) != 0 {
 		t.Fatal("expired retiring marker should have been cleaned up")
 	}
 }
