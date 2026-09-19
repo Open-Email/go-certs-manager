@@ -15,6 +15,7 @@ import (
 
 	"bytes"
 
+	"github.com/Open-Email/go-certs-manager/internal/layout"
 	"github.com/Open-Email/go-certs-manager/internal/safego"
 	"github.com/Open-Email/go-certs-manager/storage"
 )
@@ -95,13 +96,13 @@ type OnDemandConfig struct {
 // read it. Sharing it through storage rather than having every node call the
 // authority keeps credentials on one node, makes the fleet's view consistent,
 // and means a follower needs no network path to the control plane at all.
-const onDemandStateKey = "ondemand/hosts.json"
+const onDemandStateKey = layout.OnDemandHosts
 
 // certIndexKey maps hostname -> leaf NotAfter for every on-demand certificate
 // in storage. Followers diff it once per tick and refresh only what changed,
 // instead of issuing one storage read per hostname per tick — the difference
 // between O(1) and O(N) steady-state load at tens of thousands of hostnames.
-const certIndexKey = "ondemand/certs-index.json"
+const certIndexKey = layout.OnDemandCertIndex
 
 // preflightBackoff is how long a hostname that failed the DNS pre-flight is
 // skipped. Long, deliberately: the failure means a human has not finished (or
@@ -110,10 +111,7 @@ const certIndexKey = "ondemand/certs-index.json"
 // hostname on the resolver forever.
 const preflightBackoff = 24 * time.Hour
 
-type onDemandState struct {
-	GeneratedAt int64    `json:"generated_at"`
-	Hosts       []string `json:"hosts"`
-}
+type onDemandState = layout.OnDemandState
 
 // onDemand holds the runtime half of OnDemandConfig.
 type onDemand struct {

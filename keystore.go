@@ -17,6 +17,7 @@ import (
 	"strings"
 
 	"github.com/Open-Email/go-certs-manager/dane"
+	"github.com/Open-Email/go-certs-manager/internal/layout"
 	"github.com/Open-Email/go-certs-manager/storage"
 )
 
@@ -71,14 +72,14 @@ func NewKeyStore(backend storage.Backend, prefix, keyType string, isLeaderF func
 func (k *KeyStore) accountKeyName() string { return k.prefix + "acme/account.key" }
 
 func (k *KeyStore) certKeyName(domain string) string {
-	return k.prefix + "keys/" + strings.ToLower(domain)
+	return layout.Key(k.prefix, domain)
 }
 
 // nextCertKeyName is the staging slot for a key-replacement ceremony. The next
 // key is generated and persisted here, pre-published in DNS, then promoted to the
 // live slot only once the new TLSA record has propagated.
 func (k *KeyStore) nextCertKeyName(domain string) string {
-	return k.prefix + "keys/" + strings.ToLower(domain) + ".next"
+	return layout.NextKey(k.prefix, domain)
 }
 
 func (k *KeyStore) canCreate() bool {

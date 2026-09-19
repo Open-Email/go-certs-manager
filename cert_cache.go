@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/Open-Email/go-certs-manager/dane"
+	"github.com/Open-Email/go-certs-manager/internal/layout"
 	"github.com/Open-Email/go-certs-manager/storage"
 )
 
@@ -29,7 +30,7 @@ import (
 // re-issued.
 type certCache struct {
 	backend storage.Backend
-	prefix  string // "<base>certs/"
+	prefix  string // storage base prefix
 	keyFor  func(ctx context.Context, domain string) (crypto.Signer, error)
 	logger  *slog.Logger
 
@@ -70,7 +71,7 @@ func newCertCache(backend storage.Backend, basePrefix string, keyFor func(ctx co
 	}
 	return &certCache{
 		backend: backend,
-		prefix:  basePrefix + "certs/",
+		prefix:  basePrefix,
 		keyFor:  keyFor,
 		logger:  logger,
 		mem:     make(map[string]*tls.Certificate),
@@ -80,7 +81,7 @@ func newCertCache(backend storage.Backend, basePrefix string, keyFor func(ctx co
 }
 
 func (c *certCache) chainKey(domain string) string {
-	return c.prefix + strings.ToLower(domain)
+	return layout.Chain(c.prefix, domain)
 }
 
 // Get returns the in-memory certificate for a domain, if present.
