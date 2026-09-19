@@ -1,15 +1,19 @@
 package certmanager
 
 import (
+	"bytes"
 	"context"
+	"encoding/pem"
 	"errors"
 	"fmt"
 	"os"
+	"sort"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/Open-Email/go-certs-manager/dane"
+	"github.com/Open-Email/go-certs-manager/internal/layout"
 	"github.com/Open-Email/go-certs-manager/internal/safego"
 )
 
@@ -76,6 +80,12 @@ func (m *Manager) maintainOnce() {
 	// degraded storage, and leadership decides everything below — including
 	// whether this node may publish to the shared index at all.
 	leader := m.isLeader()
+
+	if leader {
+		restoreCtx, cancelRestore := m.tickContext(flushTimeout)
+		stored = append(stored, m.restoreMissingChains(restoreCtx)...)
+		cancelRestore()
+	}
 
 	ctx, cancel := m.tickContext(issueTimeout + 30*time.Second)
 	defer cancel()
@@ -371,11 +381,111 @@ func (m *Manager) flushHeldChains(ctx context.Context) []string {
 		if ctx.Err() != nil {
 			break
 		}
-		if m.flushOne(ctx, domain, p) {
+		if m.flushOne(ctx, domain, p, "TLS: stored a chain that had been held in memory since issuance") {
+			// The attempts that failed were charged to the retry budget to stop
+			// an automatic re-order; the chain is stored now, so leaving the
+			// domain throttled for the rest of the hour would punish it for a
+			// problem that is over.
+			m.retries.reset(domain)
 			stored = append(stored, domain)
 		}
 	}
 	return stored
+}
+
+// restoreMissingChains writes back certificates this leader is serving that
+// storage no longer has, and returns the names it wrote.
+//
+// Nothing else would. The leader decides whether to renew from the copy in
+// memory, so a chain removed from storage — an operator's delete, an
+// `aws s3 rm`, a bucket lifecycle rule — goes unnoticed until the renewal
+// window, weeks away. Meanwhile every node that restarts loads from storage,
+// finds nothing and refuses the handshake, and a leader handover changes
+// nothing: the new leader holds the same copy in memory. Writing back what we
+// serve closes that gap without an order, because the chain is already paid
+// for and still valid.
+//
+// One listing per tick rather than one read per name, because an on-demand
+// deployment serves thousands. The listing only nominates: the write goes
+// through flushOne, which reads the object itself and writes only when that
+// read succeeds and shows it absent, unparseable or older — a listing that
+// skipped a path it could not read must not be able to cause an overwrite.
+//
+// Only names this manager still serves, only chains that have not expired, and
+// only a chain that matches the key storage holds now. After a key replacement
+// elsewhere, writing back the old chain would pair it with a key it does not
+// match on every node that reads it.
+func (m *Manager) restoreMissingChains(ctx context.Context) []string {
+	dir := m.certCache.prefix + layout.ChainDir
+	listed, err := m.certCache.backend.ListObjects(ctx, dir, true)
+	if err != nil {
+		m.logger.Warn("TLS: cannot list stored certificates — not checking for missing ones this tick", "error", err)
+		return nil
+	}
+	inStorage := make(map[string]bool, len(listed))
+	for _, o := range listed {
+		inStorage[strings.ToLower(strings.TrimPrefix(o.Key, dir))] = true
+	}
+
+	var restored []string
+	for _, domain := range m.servedNames() {
+		if ctx.Err() != nil {
+			break
+		}
+		// A held chain is the flush's to write, under its own rules.
+		if inStorage[domain] || m.certCache.isPending(domain) {
+			continue
+		}
+		cert, ok := m.certCache.Get(domain)
+		if !ok || cert.Leaf == nil || !time.Now().Before(cert.Leaf.NotAfter) {
+			continue // nothing to put back; renewal issues one
+		}
+		key, err := m.keyStore.LoadCertKey(ctx, domain)
+		if err != nil {
+			m.logger.Warn("TLS: storage has lost the chain for a name this leader serves, and its key cannot be read — not restoring it",
+				"domain", domain, "error", err)
+			continue
+		}
+		chainPEM := encodeChainPEM(cert.Certificate)
+		if _, err := buildCertificate(chainPEM, key); err != nil {
+			m.logger.Warn("TLS: storage has lost the chain for a name this leader serves, and the copy in memory is not for the stored key — not restoring it",
+				"domain", domain, "error", err)
+			continue
+		}
+		p := pendingPersist{chainPEM: chainPEM, notAfter: cert.Leaf.NotAfter}
+		if m.flushOne(ctx, domain, p, "TLS: storage had lost the chain for a name this leader serves — wrote back the copy in memory") {
+			restored = append(restored, domain)
+		}
+	}
+	return restored
+}
+
+// servedNames is every name this manager currently serves: the configured
+// domains and the on-demand allow-set.
+func (m *Manager) servedNames() []string {
+	names := make([]string, 0, len(m.domainSet))
+	for d := range m.domainSet {
+		names = append(names, d)
+	}
+	sort.Strings(names)
+	if m.onDemand != nil {
+		for _, h := range m.onDemand.hosts() {
+			if !m.domainSet[h] {
+				names = append(names, h)
+			}
+		}
+	}
+	return names
+}
+
+// encodeChainPEM turns a served certificate's DER chain back into the PEM
+// storage holds.
+func encodeChainPEM(ders [][]byte) []byte {
+	var buf bytes.Buffer
+	for _, der := range ders {
+		_ = pem.Encode(&buf, &pem.Block{Type: "CERTIFICATE", Bytes: der})
+	}
+	return buf.Bytes()
 }
 
 // errStoredChainUnparseable marks a stored object that was read but is not a
@@ -383,23 +493,26 @@ func (m *Manager) flushHeldChains(ctx context.Context) []string {
 // what storage holds, and it is worthless, so ours is safe to write over.
 var errStoredChainUnparseable = errors.New("tls: stored chain could not be parsed")
 
-// flushOne is one domain's flush, split out so the lock and lease releases are
-// plain defers rather than a hand-unwound loop body.
-func (m *Manager) flushOne(ctx context.Context, domain string, p pendingPersist) bool {
+// flushOne writes a chain this node holds in memory to storage, if storage
+// does not already hold one at least as new. Split out so the lock and lease
+// releases are plain defers rather than a hand-unwound loop body. stored is
+// the line logged when it writes, which is the one thing its two callers — a
+// held chain and a restored one — need to say differently.
+func (m *Manager) flushOne(ctx context.Context, domain string, p pendingPersist, stored string) bool {
 	// tryLock, not lock: the holder is an issuance or an operator's renewal for
 	// this same domain, whose result supersedes what we hold — and it keeps the
 	// mutex across a whole ACME order, which would park the flush well past its
 	// own deadline and delay every domain queued behind it.
 	unlock, free := m.inflight.tryLock(domain)
 	if !free {
-		m.logger.Debug("TLS: not flushing a held chain — issuance in progress for it", "domain", domain)
+		m.logger.Debug("TLS: not writing the chain in memory — issuance in progress for it", "domain", domain)
 		return false
 	}
 	defer unlock()
 
 	release, ok := m.acquireIssueLease(ctx, domain)
 	if !ok {
-		m.logger.Debug("TLS: not flushing a held chain — another node holds the lease", "domain", domain)
+		m.logger.Debug("TLS: not writing the chain in memory — another node holds the lease", "domain", domain)
 		return false
 	}
 	defer release()
@@ -414,11 +527,11 @@ func (m *Manager) flushOne(ctx context.Context, domain string, p pendingPersist)
 		// holding, so the next tick tries again instead of stranding memory on
 		// the old chain with nothing left to notice it.
 		if _, rerr := m.certCache.Refresh(ctx, domain); rerr != nil {
-			m.logger.Warn("TLS: storage is ahead but its chain could not be adopted — holding on and retrying next tick",
+			m.logger.Warn("TLS: storage is ahead but its chain could not be adopted — keeping the chain in memory",
 				"domain", domain, "error", rerr)
 			return false
 		}
-		m.logger.Info("TLS: storage holds a chain at least as new — dropping the held copy", "domain", domain)
+		m.logger.Info("TLS: storage holds a chain at least as new as the one in memory — using it", "domain", domain)
 		m.certCache.dropPending(domain)
 		return false
 	case err == nil:
@@ -429,22 +542,17 @@ func (m *Manager) flushOne(ctx context.Context, domain string, p pendingPersist)
 		// Storage holds something that is not a chain. Read, not guessed: ours
 		// is unambiguously better, and refusing here would strand the domain
 		// until an operator deleted the object by hand.
-		m.logger.Warn("TLS: the stored chain is unreadable — replacing it with the held one", "domain", domain)
+		m.logger.Warn("TLS: the stored chain is unreadable — replacing it with the one in memory", "domain", domain)
 	default:
-		m.logger.Warn("TLS: cannot check what storage holds — leaving the held chain alone", "domain", domain, "error", err)
+		m.logger.Warn("TLS: cannot check what storage holds — not writing the chain in memory", "domain", domain, "error", err)
 		return false
 	}
 
 	if err := m.certCache.persist(ctx, domain, p.chainPEM, 1); err != nil {
-		m.logger.Warn("TLS: still cannot store the issued chain — it stays in memory only", "domain", domain, "error", err)
+		m.logger.Warn("TLS: cannot write the chain in memory to storage — retrying next tick", "domain", domain, "error", err)
 		return false
 	}
-	m.logger.Info("TLS: stored a chain that had been held in memory since issuance", "domain", domain)
-	// The attempts that failed were charged to the retry budget to stop an
-	// automatic re-order; the chain is stored now, so leaving the domain
-	// throttled for the rest of the hour would punish it for a problem that is
-	// over.
-	m.retries.reset(domain)
+	m.logger.Info(stored, "domain", domain)
 	m.certCache.dropPending(domain)
 	return true
 }

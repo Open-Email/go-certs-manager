@@ -228,6 +228,15 @@ Static domains are unaffected, and 0 keeps the original behaviour.
 - **Control plane down (on-demand)**: the last good allow-set is kept, so
   certificates already serving traffic keep serving and keep renewing. A
   hostname added during the outage is refused until enumeration recovers.
+- **Chain deleted from storage**: the leader decides whether to renew from
+  its in-memory copy, so a chain removed from storage (an operator's delete, a
+  bucket lifecycle rule) would go unnoticed until the renewal window, while any
+  node that restarted meanwhile found nothing to serve. Each maintenance tick
+  the leader lists `certs/` once and writes back any chain it serves that is
+  missing — no order, since the chain is already paid for. It writes only
+  after reading the object itself (a listing can skip what it could not read),
+  only for names it still serves, only an unexpired chain, and only one that
+  matches the key storage holds now.
 - **Leader restart (on-demand)**: on-demand hostnames are not preloaded, so the
   leader loads them from the shared index before classifying work — otherwise it
   would read every one as a first issuance and spend the hour's new-order budget
