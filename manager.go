@@ -56,7 +56,7 @@ type LetsEncryptConfig struct {
 	DefaultDomain       string
 	SyncIntervalMinutes int    // renewal-check + follower refresh interval (default 5)
 	Staging             bool   // use Let's Encrypt staging environment (issued certs untrusted)
-	RenewBeforeDays     int    // days before expiry to renew (0 = default 30)
+	RenewBeforeDays     int    // days before expiry to renew (0 = DefaultRenewBefore, 30 days)
 	MaxRetriesPerHour   int    // max failed issuance attempts per domain per hour (0 = default 3)
 	KeyType             string // "ecdsa-p256" (default) or "rsa-2048"
 	DANE                DANEConfig
@@ -105,6 +105,10 @@ type Manager struct {
 	doneCh   chan struct{}
 }
 
+// DefaultRenewBefore is how long before expiry a certificate is renewed when
+// Config.LetsEncrypt.RenewBeforeDays is unset.
+const DefaultRenewBefore = 30 * 24 * time.Hour
+
 // NewManager creates a TLS manager. backend is the shared storage backend; prefix
 // is the storage base prefix (e.g. cfg.Storage.S3Prefix). If isLeaderF is provided
 // and non-nil, only the cluster leader mints keys and talks to the CA.
@@ -138,7 +142,7 @@ func NewManager(ctx context.Context, cfg *Config, backend storage.Backend, prefi
 	// always exists by the time a chain does, so this is load-only (never mints).
 	cc := newCertCache(backend, prefix, keyStore.LoadCertKey, logger)
 
-	renewBefore := 30 * 24 * time.Hour
+	renewBefore := DefaultRenewBefore
 	if le.RenewBeforeDays > 0 {
 		renewBefore = time.Duration(le.RenewBeforeDays) * 24 * time.Hour
 	}

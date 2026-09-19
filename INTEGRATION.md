@@ -265,8 +265,33 @@ For admin CLIs (`smtp-in-admin` etc.):
   readers before v0.6.2 understand. Those readers cannot parse the array, so a
   fleet must be upgraded together before anyone rotates a key twice within a
   soak window (2 × max(maintenance interval, TLSA TTL), at least 10 minutes).
-- Raw storage inspection: read `certs/<domain>`, `keys/<domain>` via the
-  `storage.Backend` — object layout is documented in the README.
+- Certificates in storage — `tls list`, `tls delete`, `tls clean` — come from
+  `certstore`, not from a copy of the storage layout in your CLI:
+
+  ```go
+  open := func(ctx context.Context) (*certstore.Inventory, error) {
+      backend, prefix, err := openStorage(ctx, cfg) // the same backend and prefix the daemon uses
+      if err != nil {
+          return nil, err
+      }
+      return certstore.New(backend, prefix, cfg.TLS.LetsEncrypt.Domains, renewBefore), nil
+  }
+  env := certstore.Stdio("smtp-in-admin", open)
+  os.Exit(certstore.Run(env, argsAfterTLS))
+  ```
+
+  Print `certstore.Usage(program)` as the help for those commands. A CLI with
+  its own confirmation prompt sets `env.Confirm` to it. Exit `0` done, `1`
+  failed or refused, `2` usage, `3` no such certificate.
+
+  `delete` **refuses a certificate that is valid and in use** (configured, or
+  in the on-demand allow-set) unless `--force`, and points at `renew-cert`.
+  Deleting does not replace a certificate: a running leader writes its copy
+  back on its next maintenance pass (see the README's failure modes). `--force`
+  is for a fleet that is stopped, where the first leader to start orders a new
+  one. `clean` removes what no node can serve — expired or unparseable chains —
+  and re-reads each before deleting, so a chain renewed after the listing is
+  kept. Keys are never deleted, so a later certificate keeps its SPKI.
 
 ## 8. Config schema (recommended TOML)
 

@@ -249,6 +249,8 @@ Static domains are unaffected, and 0 keeps the original behaviour.
 | `certmanager` (root) | `Manager` (issuance, renewal, handshake `tls.Config`), `KeyStore`, `Issuer`, `ChallengeServer`, `FileCertProvider` (static cert/key with SIGHUP reload), errors |
 | `storage` | `Backend` interface + `S3Backend` (aws-sdk-go-v2; any S3-compatible endpoint incl. Cloudflare R2) and `FilesystemBackend` (single node; create-once via `os.Link`) |
 | `dane` | SPKI digests, `TLSARecord` (zone-line rendering), retiring markers, DNSSEC-aware `TLSALookup` resolver |
+| `adminapi` | The manual-renewal contract: the admin endpoint's handler and the CLI client, with their exit codes |
+| `certstore` | The operator's view of certificates in storage (`Inventory`) and the `tls list/delete/clean` commands every admin CLI runs on it |
 
 Both storage backends implement atomic create-once (`PutOptions.IfNoneMatch:
 "*"` → `ConditionalPutError` on conflict); this primitive is load-bearing for
