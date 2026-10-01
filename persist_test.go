@@ -862,3 +862,161 @@ func TestOnDemandIssuance_NewOrderBudgetStillCapsFirstIssuances(t *testing.T) {
 		t.Fatalf("CA saw %d order(s) for three new hostnames on a budget of 1, want 1", ca.orders)
 	}
 }
+
+// "I could not read it" is not "there is nothing there". Every path that
+// decides whether to ORDER read the chain with `err == nil` and took any other
+// answer as absence — a GET timeout, a 5xx, a truncated body — so a leader that
+// restarted during a storage read fault re-ordered every certificate it held,
+// and the writes (which worked) overwrote the chains it had just failed to
+// read. Only a definite "not found" may lead to an order.
+func TestRenewIfNeeded_DoesNotOrderWhenTheChainCannotBeRead(t *testing.T) {
+	m, ca, flaky := newFlakyManager(t, 0)
+	ctx := context.Background()
+
+	// A fresh chain is in storage; this node holds nothing in memory (restart).
+	if err := m.renewIfNeeded(ctx, "mx.example.com"); err != nil {
+		t.Fatalf("setup: %v", err)
+	}
+	m.certCache.mu.Lock()
+	delete(m.certCache.mem, "mx.example.com")
+	m.certCache.mu.Unlock()
+	ordersBefore := ca.orders
+
+	m.certCache.backend = &readErrorBackend{Backend: flaky.Backend, failGetFor: "certs/mx.example.com"}
+
+	err := m.renewIfNeeded(ctx, "mx.example.com")
+	if err == nil {
+		t.Fatal("renewIfNeeded reported success although it could not read what storage holds")
+	}
+	if ca.orders != ordersBefore {
+		t.Fatalf("CA saw %d order(s) after a failed read, want %d — a read fault must not spend an order", ca.orders, ordersBefore)
+	}
+}
+
+// The re-check under the lease is the last line before the CA, and it had the
+// same flaw: a peer's fresh certificate that could not be read for a moment
+// was ordered over.
+func TestIssueWithKey_DoesNotOrderWhenTheRecheckCannotRead(t *testing.T) {
+	m, ca, flaky := newFlakyManager(t, 0)
+	ctx := context.Background()
+	key, err := m.keyStore.LoadCertKey(ctx, "mx.example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.certCache.backend = &readErrorBackend{Backend: flaky.Backend, failGetFor: "certs/mx.example.com"}
+
+	if _, err := m.issueWithKey(ctx, "mx.example.com", key, false); err == nil {
+		t.Fatal("issueWithKey succeeded although storage could not be read")
+	}
+	if ca.orders != 0 {
+		t.Fatalf("CA saw %d order(s), want 0", ca.orders)
+	}
+}
+
+// The operator's forced renewal is the one caller that means "order whatever
+// storage says", and a read fault must not get in its way.
+func TestIssueWithKey_ForceOrdersDespiteAFailedRecheck(t *testing.T) {
+	m, ca, flaky := newFlakyManager(t, 0)
+	ctx := context.Background()
+	key, err := m.keyStore.LoadCertKey(ctx, "mx.example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.certCache.backend = &readErrorBackend{Backend: flaky.Backend, failGetFor: "certs/mx.example.com"}
+
+	if _, err := m.issueWithKey(ctx, "mx.example.com", key, true); err != nil {
+		t.Fatalf("forced issuance: %v", err)
+	}
+	if ca.orders != 1 {
+		t.Fatalf("CA saw %d order(s), want 1", ca.orders)
+	}
+}
+
+// A chain in storage that does not match the live key is not "no chain". It
+// is what an interrupted key-replacement ceremony leaves behind — the chain is
+// for the staged key and the promotion has not landed — and ordering for the
+// old key here overwrote that chain, spent a second order, and undid the
+// ceremony that reconcileCeremony would have completed on the next tick.
+func TestRenewIfNeeded_DoesNotOrderOverAChainForAnotherKey(t *testing.T) {
+	m, ca, _ := newFlakyManager(t, 0)
+	ctx := context.Background()
+
+	other, err := generateSigner(KeyTypeECDSAP256)
+	if err != nil {
+		t.Fatal(err)
+	}
+	chain, err := chainWithSerial(other, "mx.example.com", 7)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := m.certCache.persist(ctx, "mx.example.com", chain, 1); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := m.renewIfNeeded(ctx, "mx.example.com"); !errors.Is(err, ErrKeyCertMismatch) {
+		t.Fatalf("err = %v, want ErrKeyCertMismatch", err)
+	}
+	if ca.orders != 0 {
+		t.Fatalf("CA saw %d order(s) over a chain bound to another key, want 0", ca.orders)
+	}
+}
+
+// The on-demand loop classified a hostname whose chain could not be loaded as
+// a first issuance, and ordered.
+func TestMaintainOnDemand_DoesNotOrderWhenTheChainCannotBeRead(t *testing.T) {
+	fs, err := storage.NewFilesystemBackend(t.TempDir(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	m := newOnDemandManager(t, fs, true, OnDemandConfig{})
+	ca := &countingCA{}
+	m.issuer = ca
+	m.onDemand.store([]string{"v1.example.net"})
+
+	// A chain is in storage for the hostname.
+	key, err := m.keyStore.LoadOrCreateCertKey(ctx, "v1.example.net")
+	if err != nil {
+		t.Fatal(err)
+	}
+	chain, err := chainWithSerial(key, "v1.example.net", 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.certCache.Store(ctx, "v1.example.net", chain, key); err != nil {
+		t.Fatal(err)
+	}
+	m.certCache.mu.Lock()
+	delete(m.certCache.mem, "v1.example.net")
+	m.certCache.mu.Unlock()
+
+	m.certCache.backend = &readErrorBackend{Backend: fs, failGetFor: "certs/v1.example.net"}
+	m.maintainOnDemand(true)
+
+	if ca.orders != 0 {
+		t.Fatalf("CA saw %d order(s) for a hostname whose chain could not be read, want 0", ca.orders)
+	}
+}
+
+// The leader's handshake path for an on-demand hostname checks storage before
+// kicking an order, and a failed check kicked one.
+func TestGetCertificate_LeaderDoesNotKickIssuanceWhenStorageCannotBeRead(t *testing.T) {
+	fs, err := storage.NewFilesystemBackend(t.TempDir(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := newOnDemandManager(t, fs, true, OnDemandConfig{})
+	ca := &countingCA{}
+	m.issuer = ca
+	m.onDemand.store([]string{"v1.example.net"})
+	m.certCache.backend = &readErrorBackend{Backend: fs, failGetFor: "certs/v1.example.net"}
+
+	if _, err := m.getCertificate("v1.example.net", true); err == nil {
+		t.Fatal("handshake served a certificate it cannot have")
+	}
+	// requestIssue is asynchronous; give it every chance to have run.
+	time.Sleep(200 * time.Millisecond)
+	if ca.orders != 0 {
+		t.Fatalf("CA saw %d order(s) kicked by a handshake during a read fault, want 0", ca.orders)
+	}
+}

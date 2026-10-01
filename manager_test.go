@@ -1,6 +1,7 @@
 package certmanager
 
 import (
+	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
@@ -8,6 +9,7 @@ import (
 	"errors"
 	"log/slog"
 	"testing"
+	"time"
 
 	"github.com/Open-Email/go-certs-manager/storage"
 
@@ -126,5 +128,48 @@ func TestGetCertificate_ALPNChallenge(t *testing.T) {
 	}
 	if got != tokenCert {
 		t.Fatal("ALPN branch did not return the staged token certificate")
+	}
+}
+
+// A follower's handshake took the per-domain issuance mutex around its storage
+// read — the same mutex an order holds for its whole duration. On a node
+// demoted mid-order, every handshake for a name not yet in memory waited for
+// that order to finish. A read must never queue behind an order.
+func TestGetCertificate_FollowerHandshakeDoesNotWaitForAnOrder(t *testing.T) {
+	m := newServingManager(t)
+	ctx := context.Background()
+	key, err := m.keyStore.LoadOrCreateCertKey(ctx, "mx.example.com")
+	if err == nil {
+		// keystore is follower-gated; create via a leader-capable store
+		_ = key
+	}
+	ks := NewKeyStore(m.certCache.backend, "", KeyTypeECDSAP256, func() bool { return true }, nil)
+	key, err = ks.LoadOrCreateCertKey(ctx, "mx.example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.certCache.Store(ctx, "mx.example.com", selfSignedChainPEM(t, key, "mx.example.com"), key); err != nil {
+		t.Fatal(err)
+	}
+	m.certCache.mu.Lock()
+	delete(m.certCache.mem, "mx.example.com")
+	m.certCache.mu.Unlock()
+
+	// An order for the domain is in flight on this node.
+	unlock := m.inflight.lock("mx.example.com")
+	defer unlock()
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := m.tlsConfig.GetCertificate(&tls.ClientHelloInfo{ServerName: "mx.example.com"})
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("handshake failed although the chain is in storage: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("handshake waited on an order in flight")
 	}
 }

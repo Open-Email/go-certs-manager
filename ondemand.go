@@ -212,8 +212,7 @@ func (o *onDemand) hosts() []string {
 func (o *onDemand) store(hosts []string) {
 	set := make(map[string]struct{}, len(hosts))
 	for _, h := range hosts {
-		h = strings.TrimSuffix(strings.ToLower(strings.TrimSpace(h)), ".")
-		if h != "" {
+		if h = normalizeDomain(h); h != "" {
 			set[h] = struct{}{}
 		}
 	}
@@ -264,13 +263,7 @@ func (o *onDemand) refreshLeader(ctx context.Context, logger interface{ Warn(str
 		logger.Warn("TLS: on-demand enumeration failed — keeping the previous allow-set", "error", err)
 		return
 	}
-	normalized := make([]string, 0, len(hosts))
-	for _, h := range hosts {
-		h = strings.TrimSuffix(strings.ToLower(strings.TrimSpace(h)), ".")
-		if h != "" {
-			normalized = append(normalized, h)
-		}
-	}
+	normalized := normalizeDomains(hosts)
 	sort.Strings(normalized)
 	o.store(normalized)
 

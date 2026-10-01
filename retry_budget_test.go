@@ -2,6 +2,10 @@ package certmanager
 
 import (
 	"context"
+	"fmt"
+	"net/http"
+
+	"golang.org/x/crypto/acme"
 	"log/slog"
 	"strings"
 	"testing"
@@ -125,5 +129,33 @@ func TestIssueWithKeyRespectsRetryBudget(t *testing.T) {
 	if _, err := m.issueWithKey(ctx, "mx.example.com", key, false); err == nil ||
 		!strings.Contains(err.Error(), "retry budget exhausted") {
 		t.Fatalf("expected retry-budget error, got %v", err)
+	}
+}
+
+// A rate-limit answer from the CA names how long to wait, and that was
+// honoured only within one call. Across attempts the budget allowed three
+// more orders an hour against a limit that had just said "a week".
+func TestIssueWithKey_HonoursRetryAfterAcrossAttempts(t *testing.T) {
+	m, ca, _ := newFlakyManager(t, 0)
+	ctx := context.Background()
+	key, err := m.keyStore.LoadCertKey(ctx, "mx.example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ca.err = fmt.Errorf("authorize order for mx.example.com: %w", &acme.Error{
+		StatusCode:  429,
+		ProblemType: "urn:ietf:params:acme:error:rateLimited",
+		Detail:      "too many certificates (5) already issued for this exact set of identifiers",
+		Header:      http.Header{"Retry-After": []string{"3600"}},
+	})
+
+	if _, err := m.issueWithKey(ctx, "mx.example.com", key, false); err == nil {
+		t.Fatal("setup: expected the rate-limit error")
+	}
+	for i := 0; i < 3; i++ {
+		m.issueWithKey(ctx, "mx.example.com", key, false)
+	}
+	if ca.orders != 1 {
+		t.Fatalf("CA saw %d order(s) within the Retry-After the CA named, want 1", ca.orders)
 	}
 }

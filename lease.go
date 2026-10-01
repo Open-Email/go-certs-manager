@@ -33,10 +33,18 @@ const issueLeaseTTL = 5 * time.Minute
 // CA's validation". Both nodes can reach S3 even across a node-to-node partition,
 // so S3 is the arbiter that gossip cannot be.
 //
-// This is NOT a perfect distributed lock: taking over an EXPIRED lease (crashed
-// holder) has a small race window without compare-and-swap, bounded to at most one
-// duplicate order. Acceptable given the bounded blast radius (LE rate limits, not
-// data loss); a fenced/quorum leader is the hard-guarantee alternative.
+// Taking over an EXPIRED lease (crashed holder) is one conditional write
+// against the ETag the stale record was read with (IfMatch), so two nodes that
+// both read it expired cannot both win: the first write changes the ETag and
+// the second fails its precondition. It used to be read, delete, create — three
+// steps two nodes interleaved, and the second delete removed the first node's
+// fresh lease, so both drove orders for the same domain.
+//
+// What remains best-effort: expiry is the writer's wall clock, so clock skew
+// shortens or lengthens a lease; and release is read-then-delete, so a holder
+// releasing at the very moment its expired lease is taken over can delete the
+// successor's. The TTL is sized so a live holder never reaches that moment
+// (issueLeaseTTL against issueTimeout).
 type issueLeaser struct {
 	backend storage.Backend
 	prefix  string
@@ -71,17 +79,39 @@ func (l *issueLeaser) acquire(ctx context.Context, domain string) (func(), bool)
 	}
 
 	// Conflict: inspect the existing lease. If it has expired (crashed holder),
-	// attempt a single take-over. Otherwise back off.
+	// attempt a single take-over, conditional on the record being the one we
+	// read. Otherwise back off. The ETag is taken BEFORE the record is read:
+	// a record that changed in between is a fresh lease, and reads as one.
+	info, err := l.backend.StatObject(ctx, key)
+	if err != nil {
+		return nil, false // released meanwhile, or unreadable: next tick
+	}
 	existing, err := l.read(ctx, key)
-	if err == nil && time.Now().Unix() >= existing.ExpiresAt {
-		l.logger.Warn("TLS: taking over expired issuance lease", "domain", domain, "stale_owner", existing.Owner)
-		if rmErr := l.backend.RemoveObject(ctx, key); rmErr == nil {
-			if l.tryCreate(ctx, key, data) {
-				return l.releaser(key), true
-			}
-		}
+	if err != nil || time.Now().Unix() < existing.ExpiresAt {
+		return nil, false
+	}
+	l.logger.Warn("TLS: taking over expired issuance lease", "domain", domain, "stale_owner", existing.Owner)
+	if l.takeOver(ctx, key, data, info.ETag) {
+		return l.releaser(key), true
 	}
 	return nil, false
+}
+
+// takeOver replaces an expired lease record, succeeding only if it is still
+// the record read with etag. A failed precondition means a peer took it over
+// first.
+func (l *issueLeaser) takeOver(ctx context.Context, key string, data []byte, etag string) bool {
+	err := l.backend.PutObject(ctx, key, strings.NewReader(string(data)), int64(len(data)),
+		storage.PutOptions{ContentType: "application/json", IfMatch: etag})
+	if err == nil {
+		return true
+	}
+	var condErr *storage.ConditionalPutError
+	if errors.As(err, &condErr) {
+		return false // a peer took it over first
+	}
+	l.logger.Warn("TLS: issuance lease take-over failed; deferring issuance", "key", key, "error", err)
+	return false
 }
 
 func (l *issueLeaser) tryCreate(ctx context.Context, key string, data []byte) bool {

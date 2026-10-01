@@ -39,11 +39,12 @@ backend := storage.NewS3Backend(s3c, "openemail-certs", logger)
 backend, err := storage.NewFilesystemBackend("/var/lib/<svc>/certstate", logger)
 ```
 
-> The backend's conditional put (`IfNoneMatch: "*"`) must be atomic — both
-> shipped backends are. R2 supports it natively. If you point this at another
-> S3-compatible store, verify it honors `If-None-Match: *` (MinIO ≥ RELEASE.
-> 2024-08 does; some gateways silently ignore it, which breaks the lease and
-> key create-once).
+> The backend's conditional puts (`IfNoneMatch: "*"` and `IfMatch`) must be
+> atomic — both shipped backends are. R2 supports them natively. `NewManager`
+> probes the backend at start: on one that silently ignores `If-None-Match`
+> (some gateways do; MinIO ≥ RELEASE.2024-08 honours it) a clustered manager
+> refuses to start, since the lease and the key create-once would do nothing,
+> and a single-node manager carries on without the lease.
 
 ## 2. Leader predicate (clusters only)
 
@@ -90,8 +91,17 @@ mgr, err := certmanager.NewManager(ctx, &certmanager.Config{
         if matched { v = 1.0 }
         metrics.DANETLSAPublishedMatch.WithLabelValues(host).Set(v)
     },
+    OnServedExpiry: func(domain string, notAfter time.Time) { // optional metrics hook
+        // What THIS node serves, every maintenance pass; zero time = nothing.
+        metrics.TLSCertExpiry.WithLabelValues(domain).Set(float64(notAfter.Unix()))
+    },
 }, backend, cfg.Storage.S3Prefix, logger, isLeader)
 ```
+
+Export `OnServedExpiry` as a gauge of the Unix expiry and alert on
+`min by (domain) (expiry) - time() < 7 * 86400`. Every node reports its own
+series, so a node left behind on a stale certificate is visible — a health
+check that dials the hostname through DNS may be describing another node.
 
 Semantics to know:
 
@@ -103,6 +113,9 @@ Semantics to know:
 - `prefix` is the storage key prefix shared with the rest of your deployment's
   objects (e.g. `cfg.Storage.S3Prefix`); pass `""` for none.
 - `KeyType` must stay constant once keys exist.
+- Names are filed under one spelling — lower case, no trailing dot, punycode —
+  so `Domains`, `DefaultDomain`, `DANE.MXHosts`, the on-demand set and the
+  admin commands may all be written as an operator would type them.
 
 ## 3b. On-demand hostnames (multi-tenant vanity names)
 
@@ -162,6 +175,11 @@ safego.Go(logger, "acme-http", func() {
 
 If the host already runs an HTTP server on :80 (health/API), mount the handler
 instead: `mux.Handle("/.well-known/acme-challenge/", mgr.HTTPHandler())`.
+
+The handler answers only requests whose token has the shape of one (base64url,
+at most 128 characters); anything else is 404 without a storage read. It used
+to pass the path straight through as a storage key, and on the filesystem
+backend `../../keys/<domain>` was that domain's private key.
 
 If :443 cannot be bound (something else owns it), don't start the ALPN server —
 the issuer automatically falls back to HTTP-01 when the ALPN authorization

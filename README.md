@@ -38,6 +38,7 @@ has properties that are wrong for a clustered mail fleet:
                        │  acme/account.key   keys/<domain>[.next]     │
                        │  certs/<domain>     challenges/{alpn,http}/  │
                        │  locks/issue/<domain>  dane/retiring/<host>  │
+                       │  orders/<domain>  (the order in flight)      │
                        └────────▲──────────────────▲─────────────────┘
                                 │                  │
               issue / renew / lease          refresh / serve
@@ -62,17 +63,28 @@ has properties that are wrong for a clustered mail fleet:
    Encrypt's 5-failed-validations/hostname/hour limit, so a persistent local
    failure never exhausts the CA-side budget.
 3. The **issuance lease** (`locks/issue/<domain>`) is acquired via the storage
-   backend's atomic create-once (`IfNoneMatch: "*"`, 5-minute TTL). This is the
+   backend's atomic create-once (`IfNoneMatch: "*"`, 5-minute TTL); an expired
+   lease is taken over by one conditional write against its ETag (`IfMatch`),
+   so two nodes that both read it expired cannot both win. This is the
    split-brain guard: the leader predicate is unfenced (a network partition can
    produce two believed-leaders), but both sides can reach storage, so storage
    is the arbiter gossip cannot be. After acquiring, storage is re-checked for
-   a peer-produced fresh cert before ordering.
+   a peer-produced fresh cert before ordering — and **only a definite "not
+   found" leads to an order**: a read that failed, a chain that did not parse
+   or one bound to another key stops the attempt (`ErrStorageUnavailable`).
+   That rule holds at every decision to order (maintenance, the re-check under
+   the lease, the on-demand loop, the leader's handshake path).
 4. The **issuer** drives RFC 8555 directly via `x/crypto/acme`: order →
    authorization → challenge → CSR built from the **persistent domain key** →
-   finalize. TLS-ALPN-01 is preferred, HTTP-01 the fallback.
+   finalize. TLS-ALPN-01 is preferred, HTTP-01 the fallback. The order's URL is
+   **journaled** (`orders/<domain>`) before anything the CA can charge for;
+   an attempt interrupted after issuance — a deploy restart, a deadline, a
+   reset connection on the download — is collected by the next attempt instead
+   of repeated. The CA counts an order the moment it signs.
 5. Challenge tokens are **mirrored to storage** (`challenges/…`) so whichever
    node the CA happens to validate against can answer — required behind a
-   load balancer or round-robin MX.
+   load balancer or round-robin MX. A token that could not be mirrored is not
+   presented: the validation would be one the CA may fail, and count.
 6. The issued chain is persisted to `certs/<domain>` (PEM, leaf first —
    **without** the private key, which lives only in `keys/`), and installed in
    the in-memory cache.
@@ -81,10 +93,15 @@ has properties that are wrong for a clustered mail fleet:
 
 `Manager.TLSConfig().GetCertificate`:
 
-- answers TLS-ALPN-01 challenges from the in-memory/mirrored token cert;
+- answers TLS-ALPN-01 challenges from the in-memory/mirrored token cert — for
+  names in the allow-list only, so an `acme-tls/1` hello for any other name is
+  refused without a storage read;
 - lowercases the SNI (RFC 4343), substitutes `DefaultDomain` for missing or
   IP-literal SNI (common with legacy MTAs; failing would break opportunistic
-  inbound TLS), rejects hosts outside the configured domain whitelist;
+  inbound TLS), rejects hosts outside the configured domain whitelist. Names
+  are filed under one spelling everywhere (lower case, no trailing dot,
+  punycode), so a Unicode domain in the configuration matches the A-label a
+  client sends;
 - serves from the in-memory cache. On a miss: the **leader** kicks async
   issuance and fails the handshake with `ErrCertificateUnavailable` (the MTA
   retries; maintenance fills the cache); a **follower** does a throttled,
@@ -212,11 +229,29 @@ Static domains are unaffected, and 0 keeps the original behaviour.
 ## Failure modes and guarantees
 
 - **Split-brain**: two believed-leaders are serialized by the storage lease.
-  Taking over an *expired* lease (crashed holder) has a small non-CAS race
-  bounded to at most one duplicate order — accepted (blast radius is CA rate
-  limits, not correctness).
+  Taking over an *expired* lease (crashed holder) is one conditional write
+  against the record's ETag, so only one node wins. What remains best-effort:
+  expiry is the writer's wall clock, and a holder releasing at the very moment
+  its expired lease is taken over can delete the successor's (the TTL is sized
+  so a live holder never gets there). `NewManager` probes the backend for
+  conditional-write support and refuses to start a cluster on one that
+  ignores `If-None-Match`; a single node carries on without the lease.
 - **Storage down**: leases fail safe (no issuance while uncertain); handshakes
   keep serving in-memory certs; followers keep last-good certs.
+- **Storage reads failing while writes work**: no order. "I could not read
+  it" is never "there is nothing there" — only a definite not-found leads to
+  an order. The alternative was a leader restarted during a read fault
+  re-ordering every certificate it held and overwriting the chains it had
+  just failed to read.
+- **Attempt interrupted after the CA issued**: the order is journaled before
+  it is placed and collected on the next attempt (`orders/<domain>`), for the
+  seven days the CA keeps it. If the journal cannot be read, no order is
+  placed — the attempt cannot know whether one is outstanding.
+- **CA rate limit**: the `Retry-After` the CA names is honoured across
+  attempts (an hour when it names none), on top of the retry budget. Logged
+  at error level with the CA's problem detail.
+- **A challenge that cannot be shared**: not presented. The order fails
+  before `Accept`, so the CA counts nothing.
 - **Inconsistent read during ceremony**: a follower pairing the new chain with
   the not-yet-promoted old key gets `ErrKeyCertMismatch` and keeps serving its
   last-good certificate until storage is consistent.
@@ -247,7 +282,7 @@ Static domains are unaffected, and 0 keeps the original behaviour.
 | Package | Contents |
 |---|---|
 | `certmanager` (root) | `Manager` (issuance, renewal, handshake `tls.Config`), `KeyStore`, `Issuer`, `ChallengeServer`, `FileCertProvider` (static cert/key with SIGHUP reload), errors |
-| `storage` | `Backend` interface + `S3Backend` (aws-sdk-go-v2; any S3-compatible endpoint incl. Cloudflare R2) and `FilesystemBackend` (single node; create-once via `os.Link`) |
+| `storage` | `Backend` interface + `S3Backend` (aws-sdk-go-v2; any S3-compatible endpoint incl. Cloudflare R2) and `FilesystemBackend` (single node; create-once via `os.Link`). A key is a name, never a path: a `..` segment is refused |
 | `dane` | SPKI digests, `TLSARecord` (zone-line rendering), retiring markers, DNSSEC-aware `TLSALookup` resolver |
 | `adminapi` | The manual-renewal contract: the admin endpoint's handler and the CLI client, with their exit codes |
 | `certstore` | The operator's view of certificates in storage (`Inventory`) and the `tls list/delete/clean` commands every admin CLI runs on it |

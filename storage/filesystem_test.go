@@ -6,6 +6,7 @@ package storage
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io"
 	"os"
 	"path/filepath"
@@ -418,11 +419,10 @@ func TestFilesystemBackend_GetFullPath(t *testing.T) {
 		t.Errorf("Expected %s (ok=true), got %s (ok=%v)", expected, path, ok)
 	}
 
-	// Test key with .. that stays within base (should succeed)
-	path, ok = backend.getFullPath("test/../key.txt")
-	expected = filepath.Join(tmpDir, "key.txt")
-	if !ok || path != expected {
-		t.Errorf("Expected %s (ok=true), got %s (ok=%v)", expected, path, ok)
+	// A ".." that would stay within base is refused all the same: a key is a
+	// name, not a path, and this was how a challenge token became a key read.
+	if _, ok = backend.getFullPath("test/../key.txt"); ok {
+		t.Error("Expected a key with a .. segment to be refused, but it was allowed")
 	}
 
 	// Test directory traversal attack (should be blocked)
@@ -471,4 +471,23 @@ func TestConditionalPutError(t *testing.T) {
 	}
 
 	t.Log("✓ ConditionalPutError implements error interface")
+}
+
+// A key is a storage name, never a path: a ".." segment has no meaning in one
+// and is refused outright rather than cleaned into a path that happens to stay
+// under the base directory.
+func TestFilesystemBackend_RefusesDotDotSegments(t *testing.T) {
+	b, err := NewFilesystemBackend(t.TempDir(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	if err := b.PutObject(ctx, "keys/mx.example.com", bytes.NewReader([]byte("k")), 1, PutOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range []string{"challenges/http/../../keys/mx.example.com", "../keys/mx.example.com", "keys/../keys/mx.example.com"} {
+		if _, err := b.GetObject(ctx, key); !errors.Is(err, errPathTraversal) {
+			t.Errorf("GetObject(%q) err = %v, want errPathTraversal", key, err)
+		}
+	}
 }
