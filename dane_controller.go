@@ -53,7 +53,7 @@ func newDANEController(ks *KeyStore, backend storage.Backend, prefix string, mxH
 	}
 	mxSet := make(map[string]bool, len(mxHosts))
 	for _, h := range mxHosts {
-		mxSet[strings.ToLower(strings.TrimSuffix(h, "."))] = true
+		mxSet[normalizeDomain(h)] = true
 	}
 	return &daneController{
 		keyStore: ks,
@@ -68,7 +68,7 @@ func newDANEController(ks *KeyStore, backend storage.Backend, prefix string, mxH
 }
 
 func (d *daneController) isMX(host string) bool {
-	return d.mxSet[strings.ToLower(strings.TrimSuffix(host, "."))]
+	return d.mxSet[normalizeDomain(host)]
 }
 
 // DesiredRecords returns the TLSA records the operator should have published for

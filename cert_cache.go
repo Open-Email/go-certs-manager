@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -258,6 +259,11 @@ func leafNotAfterPEM(chainPEM []byte) (time.Time, error) {
 
 // Refresh loads the durable chain for a domain and rebuilds the in-memory
 // certificate. Returns os.ErrNotExist (wrapped) if no chain has been issued yet.
+//
+// Storage has three answers, and callers that decide whether to ORDER must
+// keep them apart: "here it is", "there is none" (os.ErrNotExist), and "I could
+// not tell" — every other error. Only the second may lead to an order; see
+// absentFromStorage.
 func (c *certCache) Refresh(ctx context.Context, domain string) (*tls.Certificate, error) {
 	chainPEM, err := c.loadChain(ctx, domain)
 	if err != nil {
@@ -273,6 +279,17 @@ func (c *certCache) Refresh(ctx context.Context, domain string) (*tls.Certificat
 	}
 	c.set(domain, cert)
 	return cert, nil
+}
+
+// absentFromStorage reports whether a Refresh error is the definite answer
+// that no chain is stored — the only answer that justifies placing an order.
+// A read that failed, a chain that did not parse, or one bound to a key other
+// than the live one (an interrupted key-replacement ceremony, which
+// reconcileCeremony completes) all mean something IS there, or might be, and
+// ordering over it spent a certificate for a transient fault: every chain a
+// restarted leader could not read for a moment was re-ordered and overwritten.
+func absentFromStorage(err error) bool {
+	return errors.Is(err, os.ErrNotExist)
 }
 
 // storedLeafSPKI returns the DANE SPKI SHA-256 digest of the leaf in the durable

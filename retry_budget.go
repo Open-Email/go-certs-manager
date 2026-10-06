@@ -25,6 +25,7 @@ type retryBudget struct {
 
 	mu       sync.Mutex
 	failures map[string][]time.Time // domain -> failure times within the window
+	blocked  map[string]time.Time   // domain -> when the CA's rate limit lifts
 }
 
 func newRetryBudget(max int) *retryBudget {
@@ -32,7 +33,19 @@ func newRetryBudget(max int) *retryBudget {
 		max:      max,
 		now:      time.Now,
 		failures: make(map[string][]time.Time),
+		blocked:  make(map[string]time.Time),
 	}
+}
+
+// block refuses every attempt for domain until the given time: the CA has
+// said it is rate-limited, and it means across attempts.
+func (b *retryBudget) block(domain string, until time.Time) {
+	if b == nil {
+		return
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.blocked[strings.ToLower(domain)] = until
 }
 
 // allow reports whether another issuance attempt may run for domain. When the
@@ -47,6 +60,12 @@ func (b *retryBudget) allow(domain string) (time.Duration, bool) {
 	domain = strings.ToLower(domain)
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	if until, ok := b.blocked[domain]; ok {
+		if wait := until.Sub(b.now()); wait > 0 {
+			return wait, false
+		}
+		delete(b.blocked, domain)
+	}
 	recent := b.prune(domain)
 	if len(recent) < b.max {
 		return 0, true
@@ -73,6 +92,7 @@ func (b *retryBudget) reset(domain string) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	delete(b.failures, strings.ToLower(domain))
+	delete(b.blocked, strings.ToLower(domain))
 }
 
 // prune drops failures older than the window and returns what remains, oldest

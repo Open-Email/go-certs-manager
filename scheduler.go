@@ -132,6 +132,20 @@ func (m *Manager) maintainOnce() {
 	}
 
 	m.maintainOnDemand(leader)
+	m.reportServed()
+}
+
+// reportServed hands the configured callback the expiry of what this node
+// holds for every name it serves — the zero time for a name it holds nothing
+// for, so "none" is reported rather than left as the last value.
+func (m *Manager) reportServed() {
+	if m.onServedExpiry == nil {
+		return
+	}
+	for _, name := range m.servedNames() {
+		notAfter, _ := m.certCache.leafNotAfter(name)
+		m.onServedExpiry(name, notAfter)
+	}
 }
 
 // maintainOnDemand is the same duty for the DYNAMIC allow-set, and it is a
@@ -272,9 +286,14 @@ func (m *Manager) maintainOnDemand(leader bool) {
 		// Adopting also republishes the index through the tail of this
 		// function, which is what finally tells the followers it exists.
 		if !isRenewal {
-			if _, err := m.certCache.Refresh(ctx, host); err == nil {
+			switch _, err := m.certCache.Refresh(ctx, host); {
+			case err == nil:
 				m.logger.Info("TLS: storage already held a certificate the index did not mention — adopting it instead of ordering", "domain", host)
 				isRenewal = true
+			case absentFromStorage(err):
+			default:
+				m.logger.Warn("TLS: on-demand issuance skipped — cannot tell whether storage holds a certificate", "domain", host, "error", err)
+				return
 			}
 		}
 		// The new-order budget stays first-issuance only: renewals are bounded
@@ -618,16 +637,32 @@ func (m *Manager) reconcileCeremony(ctx context.Context, domain string) {
 func (m *Manager) renewIfNeeded(ctx context.Context, domain string) error {
 	notAfter, have := m.certCache.leafNotAfter(domain)
 	if !have {
-		// No in-memory cert; try storage, else issue.
-		if _, err := m.certCache.Refresh(ctx, domain); err == nil {
+		// No in-memory cert. Storage decides, and only a definite "none" may
+		// lead to an order: a read that failed says nothing about what is
+		// there, and a chain for another key is a ceremony in progress.
+		switch _, err := m.certCache.Refresh(ctx, domain); {
+		case err == nil:
 			notAfter, have = m.certCache.leafNotAfter(domain)
+		case absentFromStorage(err):
+		case errors.Is(err, ErrKeyCertMismatch):
+			return fmt.Errorf("not ordering for %s: the stored chain is bound to another key (a key replacement is being completed): %w", domain, err)
+		default:
+			return fmt.Errorf("not ordering for %s: %w: %v", domain, ErrStorageUnavailable, err)
 		}
 	}
 	if have && time.Until(notAfter) > m.renewBefore {
 		return nil // still fresh
 	}
 
-	unlock := m.inflight.lock(strings.ToLower(domain))
+	// tryLock, not lock: the holder is an issuance or an operator's renewal
+	// for this same domain, whose result supersedes this pass. Queueing behind
+	// it spent this domain's deadline waiting, and then started an order with
+	// seconds left on the clock.
+	unlock, free := m.inflight.tryLock(strings.ToLower(domain))
+	if !free {
+		m.logger.Debug("TLS: issuance already in progress for this domain — leaving it to that", "domain", domain)
+		return nil
+	}
 	defer unlock()
 
 	// Re-check after winning the lock: a concurrent RenewCertificate/obtain may have
@@ -668,7 +703,7 @@ func (m *Manager) ReplaceCertificateKey(domain string) ([]dane.TLSARecord, error
 	if !m.isLeader() {
 		return nil, fmt.Errorf("key replacement must be performed on the cluster leader node")
 	}
-	domain = strings.ToLower(domain)
+	domain = normalizeDomain(domain)
 	if !m.domainSet[domain] {
 		return nil, fmt.Errorf("domain %q is not in the configured domain list", domain)
 	}
@@ -708,7 +743,7 @@ func (m *Manager) ActivateCertificateKey(domain string, force bool) error {
 	if !m.isLeader() {
 		return fmt.Errorf("key activation must be performed on the cluster leader node")
 	}
-	domain = strings.ToLower(domain)
+	domain = normalizeDomain(domain)
 	if !m.domainSet[domain] {
 		return fmt.Errorf("domain %q is not in the configured domain list", domain)
 	}

@@ -46,6 +46,14 @@ type Config struct {
 	// always allowed, never dependent on the control plane being reachable. See
 	// OnDemandConfig for the rate-limit reasoning that shapes the rest.
 	OnDemand *OnDemandConfig
+
+	// OnServedExpiry, when set, receives on every maintenance pass, for every
+	// name this node serves, the expiry of the certificate THIS node holds for
+	// it — the zero time when it holds none. Every node reports its own, so a
+	// node left behind on a stale certificate shows on its own series; a check
+	// that dials the hostname through DNS may be describing another node. Wire
+	// it to a gauge.
+	OnServedExpiry func(domain string, notAfter time.Time)
 }
 
 // LetsEncryptConfig configures Let's Encrypt certificate provisioning. Certificates
@@ -92,17 +100,22 @@ type Manager struct {
 
 	onDemand *onDemand // dynamic allow-set (nil when not configured)
 
-	tlsConfig   *tls.Config
-	leaser      *issueLeaser // cluster-wide issuance lease (split-brain guard)
-	retries     *retryBudget // per-domain failed-attempt cap (CA rate-limit guard)
-	onDANEMatch func(host string, matched bool)
+	tlsConfig      *tls.Config
+	leaser         *issueLeaser // cluster-wide issuance lease (split-brain guard)
+	retries        *retryBudget // per-domain failed-attempt cap (CA rate-limit guard)
+	onDANEMatch    func(host string, matched bool)
+	onServedExpiry func(domain string, notAfter time.Time)
 
 	issuerMu sync.Mutex // guards lazy issuer creation
 	inflight keyedMutex // per-domain issuance dedupe
-	issuing  sync.Map   // domain -> struct{}: in-flight async issuance dedupe
-	stopOnce sync.Once
-	stopCh   chan struct{}
-	doneCh   chan struct{}
+	// refreshing dedupes follower storage reads per domain. Its own mutex, not
+	// inflight: an order holds inflight for its whole duration, and a handshake
+	// read that queued behind it on a node demoted mid-order waited minutes.
+	refreshing keyedMutex
+	issuing    sync.Map // domain -> struct{}: in-flight async issuance dedupe
+	stopOnce   sync.Once
+	stopCh     chan struct{}
+	doneCh     chan struct{}
 }
 
 // DefaultRenewBefore is how long before expiry a certificate is renewed when
@@ -132,6 +145,26 @@ func NewManager(ctx context.Context, cfg *Config, backend storage.Backend, prefi
 	keyType := le.KeyType
 	if keyType == "" {
 		keyType = KeyTypeECDSAP256
+	}
+
+	// Every name under its one spelling (normalizeDomain) before anything is
+	// keyed by it.
+	le.Domains = normalizeDomains(le.Domains)
+	le.DefaultDomain = normalizeDomain(le.DefaultDomain)
+	le.DANE.MXHosts = normalizeDomains(le.DANE.MXHosts)
+
+	// The lease and the key create-once are conditional writes. A backend that
+	// ignores the condition cannot serve a cluster; a single node needs no
+	// lease and carries on without one.
+	leaseBackend := backend
+	switch supported, err := verifyConditionalWrites(ctx, backend, prefix); {
+	case err != nil:
+		logger.Warn("TLS: could not verify that storage honours conditional writes — assuming it does", "error", err)
+	case !supported && leaderFunc != nil:
+		return nil, fmt.Errorf("tls: storage backend ignores If-None-Match — the issuance lease and key create-once cannot work in a cluster; use a backend that honours conditional writes")
+	case !supported:
+		logger.Warn("TLS: storage backend ignores If-None-Match — single node, so the issuance lease is disabled; do not add nodes on this backend")
+		leaseBackend = nil
 	}
 
 	keyStore := NewKeyStore(backend, prefix, keyType, leaderFunc, logger)
@@ -164,10 +197,7 @@ func NewManager(ctx context.Context, cfg *Config, backend storage.Backend, prefi
 		defaultDomain = le.Domains[0]
 	}
 
-	domainSet := make(map[string]bool, len(le.Domains))
-	for _, d := range le.Domains {
-		domainSet[strings.ToLower(d)] = true
-	}
+	domainSet := domainSetOf(le.Domains)
 
 	var daneCtl *daneController
 	if len(le.DANE.MXHosts) > 0 {
@@ -197,24 +227,25 @@ func NewManager(ctx context.Context, cfg *Config, backend storage.Backend, prefi
 
 	nodeID := randNodeID()
 	m := &Manager{
-		keyStore:      keyStore,
-		certCache:     cc,
-		challenges:    challenges,
-		dane:          daneCtl,
-		leaser:        &issueLeaser{backend: backend, prefix: prefix, nodeID: nodeID, ttl: issueLeaseTTL, logger: logger},
-		retries:       newRetryBudget(maxRetries),
-		onDANEMatch:   cfg.OnDANEPublishedMatch,
-		logger:        logger,
-		domains:       le.Domains,
-		domainSet:     domainSet,
-		defaultDomain: defaultDomain,
-		email:         le.Email,
-		staging:       le.Staging,
-		renewBefore:   renewBefore,
-		checkInterval: checkInterval,
-		isLeaderF:     leaderFunc,
-		stopCh:        make(chan struct{}),
-		doneCh:        make(chan struct{}),
+		keyStore:       keyStore,
+		certCache:      cc,
+		challenges:     challenges,
+		dane:           daneCtl,
+		leaser:         &issueLeaser{backend: leaseBackend, prefix: prefix, nodeID: nodeID, ttl: issueLeaseTTL, logger: logger},
+		retries:        newRetryBudget(maxRetries),
+		onDANEMatch:    cfg.OnDANEPublishedMatch,
+		onServedExpiry: cfg.OnServedExpiry,
+		logger:         logger,
+		domains:        le.Domains,
+		domainSet:      domainSet,
+		defaultDomain:  defaultDomain,
+		email:          le.Email,
+		staging:        le.Staging,
+		renewBefore:    renewBefore,
+		checkInterval:  checkInterval,
+		isLeaderF:      leaderFunc,
+		stopCh:         make(chan struct{}),
+		doneCh:         make(chan struct{}),
 	}
 	if cfg.OnDemand != nil {
 		m.onDemand = newOnDemand(*cfg.OnDemand, backend, prefix)
@@ -279,7 +310,9 @@ func (m *Manager) ensureIssuer(ctx context.Context) (orderer, error) {
 	if err != nil {
 		return nil, fmt.Errorf("load ACME account key: %w", err)
 	}
-	m.issuer = NewIssuer(accountKey, m.email, m.staging, m.challenges, m.logger)
+	issuer := NewIssuer(accountKey, m.email, m.staging, m.challenges, m.logger)
+	issuer.journal = newOrderJournal(m.certCache.backend, m.certCache.prefix, m.logger)
+	m.issuer = issuer
 	return m.issuer, nil
 }
 
@@ -297,16 +330,22 @@ func (m *Manager) buildTLSConfig() *tls.Config {
 	cfg.GetCertificate = func(hello *tls.ClientHelloInfo) (*tls.Certificate, error) {
 		serverName := hello.ServerName
 
+		serverName = strings.ToLower(serverName) // RFC 4343: DNS names are case-insensitive
+
 		// TLS-ALPN-01 challenge: the CA negotiates only "acme-tls/1" and expects
-		// the in-memory token certificate.
+		// the in-memory token certificate. The allow-list comes first: a
+		// validation can only be in progress for a name this node may serve, and
+		// the lookup for any other name is a storage read anyone can trigger with
+		// one ClientHello.
 		if isALPNChallenge(hello) {
-			if cert, ok := m.challenges.GetALPN(strings.ToLower(serverName)); ok {
+			if !m.allowsName(serverName) {
+				return nil, fmt.Errorf("%w: %s", ErrHostNotAllowed, serverName)
+			}
+			if cert, ok := m.challenges.GetALPN(serverName); ok {
 				return cert, nil
 			}
 			return nil, fmt.Errorf("%w: no tls-alpn-01 challenge in progress for %s", ErrCertificateUnavailable, serverName)
 		}
-
-		serverName = strings.ToLower(serverName) // RFC 4343: DNS names are case-insensitive
 
 		// A sender that omits SNI, or puts an IP literal in it (RFC 6066 forbids IP
 		// SNI, but some MTAs send it anyway), hasn't named a certificate we can serve.
@@ -328,13 +367,10 @@ func (m *Manager) buildTLSConfig() *tls.Config {
 		// memory: an SNI in neither is refused here without a single byte of I/O,
 		// which is what makes a flood of invented server names free — no storage
 		// read, no control-plane query, and above all no CA order.
-		onDemandHost := false
-		if !m.domainSet[serverName] {
-			if m.onDemand == nil || !m.onDemand.allows(serverName) {
-				return nil, fmt.Errorf("%w: %s", ErrHostNotAllowed, serverName)
-			}
-			onDemandHost = true
+		if !m.allowsName(serverName) {
+			return nil, fmt.Errorf("%w: %s", ErrHostNotAllowed, serverName)
 		}
+		onDemandHost := !m.domainSet[serverName]
 
 		cert, err := m.getCertificate(serverName, onDemandHost)
 		if err != nil {
@@ -348,6 +384,15 @@ func (m *Manager) buildTLSConfig() *tls.Config {
 		return cert, nil
 	}
 	return cfg
+}
+
+// allowsName reports whether a (lower-cased) server name is one this node may
+// serve: in the static list or the on-demand allow-set. Pure memory.
+func (m *Manager) allowsName(serverName string) bool {
+	if m.domainSet[serverName] {
+		return true
+	}
+	return m.onDemand != nil && m.onDemand.allows(serverName)
 }
 
 // getCertificate serves a cached cert. It NEVER runs the ACME flow inline on the
@@ -387,6 +432,11 @@ func (m *Manager) getCertificate(domain string, onDemandHost bool) (*tls.Certifi
 			if err == nil {
 				return cert, nil
 			}
+			// Only a definite "none" may kick an order. A read that failed
+			// says nothing, and the handshake can be repeated by anyone.
+			if !absentFromStorage(err) {
+				return nil, fmt.Errorf("%w: cannot tell whether a certificate exists for %s: %v", ErrCertificateUnavailable, domain, err)
+			}
 		}
 		m.requestIssue(domain, onDemandHost) // async, deduplicated
 		if wait > 0 {
@@ -401,9 +451,10 @@ func (m *Manager) getCertificate(domain string, onDemandHost bool) (*tls.Certifi
 	// is held only across the STORAGE READ, never across the wait below — ten
 	// connections to one not-yet-issued hostname would otherwise queue on it and
 	// the tenth would wait ten times the bound, long past any client's patience,
-	// each holding a goroutine and a connection the whole time.
+	// each holding a goroutine and a connection the whole time. It is the
+	// read lock, not the issuance one: a read must never queue behind an order.
 	cert, err := func() (*tls.Certificate, error) {
-		unlock := m.inflight.lock(domain)
+		unlock := m.refreshing.lock(domain)
 		defer unlock()
 		if cert, ok := m.certCache.Get(domain); ok { // populated while we waited
 			return cert, nil
@@ -570,12 +621,20 @@ func (m *Manager) issueWithKey(ctx context.Context, domain string, certKey crypt
 	// Re-check storage now that we hold the lease: a peer that just released it may
 	// already have produced a still-fresh certificate, so we must not re-issue.
 	// Refresh runs under force too (it adopts whatever a peer stored); only the
-	// decision to stop there is skipped.
-	if cert, err := m.certCache.Refresh(ctx, domain); err == nil && !force {
+	// decision to stop there is skipped. A read that FAILED stops everything
+	// but a forced order: this is the last look before the CA, and a peer's
+	// fresh certificate that could not be read for a moment was ordered over.
+	// Force is the operator saying "order whatever storage says".
+	stored, rerr := m.certCache.Refresh(ctx, domain)
+	switch {
+	case rerr == nil && !force:
 		if na, ok := m.certCache.leafNotAfter(domain); ok && time.Until(na) > m.renewBefore {
 			m.logger.Debug("TLS: skipping issuance — peer already produced a fresh cert", "domain", domain)
-			return cert, nil
+			return stored, nil
 		}
+	case rerr == nil, force, absentFromStorage(rerr):
+	default:
+		return nil, fmt.Errorf("not ordering for %s: %w: %v", domain, ErrStorageUnavailable, rerr)
 	}
 
 	issuer, err := m.ensureIssuer(ctx)
@@ -586,6 +645,14 @@ func (m *Manager) issueWithKey(ctx context.Context, domain string, certKey crypt
 	chainPEM, err := issuer.Issue(ctx, domain, certKey)
 	if err != nil {
 		m.retries.recordFailure(domain)
+		// A rate limit names how long to wait, and the CA means across
+		// attempts: the retry budget alone would place three more orders an
+		// hour against a limit that just said "a week".
+		if until, ok := rateLimitedUntil(err); ok {
+			m.retries.block(domain, until)
+			m.logger.Error("TLS: the CA rate-limited this domain — no further orders until the limit lifts",
+				"domain", domain, "until", until.UTC().Format(time.RFC3339), "error", err)
+		}
 		return nil, err
 	}
 	cert, err := m.certCache.Store(ctx, domain, chainPEM, certKey)
@@ -605,6 +672,28 @@ func (m *Manager) issueWithKey(ctx context.Context, domain string, certKey crypt
 	}
 	m.retries.reset(domain)
 	return cert, nil
+}
+
+// defaultRateLimitBackoff is how long a rate-limited domain waits when the CA
+// names no Retry-After. Let's Encrypt's limits are measured in hours and
+// weeks; an hour is the shortest wait that is not a guess at a shorter one.
+const defaultRateLimitBackoff = time.Hour
+
+// rateLimitedUntil reports whether err is the CA saying "rate limited", and
+// until when. acme.RateLimit wants the bare *acme.Error; ours arrive wrapped.
+func rateLimitedUntil(err error) (time.Time, bool) {
+	var ae *acme.Error
+	if !errors.As(err, &ae) {
+		return time.Time{}, false
+	}
+	wait, ok := acme.RateLimit(ae)
+	if !ok {
+		return time.Time{}, false
+	}
+	if wait <= 0 {
+		wait = defaultRateLimitBackoff
+	}
+	return time.Now().Add(wait), true
 }
 
 // acquireIssueLease takes the cluster-wide issuance lease for domain, returning a
@@ -718,7 +807,7 @@ func (m *Manager) RenewCertificate(domain string) ([]string, error) {
 	if !m.isLeader() {
 		return nil, fmt.Errorf("certificate renewal must be performed on the cluster leader node")
 	}
-	domain = strings.ToLower(domain)
+	domain = normalizeDomain(domain)
 	if !m.domainSet[domain] {
 		return nil, fmt.Errorf("domain %q is not in the configured domain list", domain)
 	}

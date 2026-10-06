@@ -7,6 +7,7 @@ import (
 	"crypto/x509"
 	"encoding/pem"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -37,7 +38,26 @@ type ChallengeServer struct {
 
 	httpMu sync.RWMutex
 	http   map[string]string // token -> key authorization
+
+	// missMu guards misses: tokens storage was recently asked about and did
+	// not have. Anyone can send a well-formed token nobody issued, and each
+	// one used to be a read against the bucket every node shares.
+	missMu sync.Mutex
+	misses map[string]time.Time
 }
+
+// tokenMissTTL is how long an unknown token is remembered as unknown. Short:
+// a token the leader is about to mirror must not be refused for long.
+const tokenMissTTL = 10 * time.Second
+
+// tokenMissCap bounds the miss table. Past it the table is dropped whole,
+// which costs a burst of reads once rather than memory for every token an
+// attacker invents.
+const tokenMissCap = 4096
+
+// maxTokenLength bounds an HTTP-01 token. Let's Encrypt's are 43 characters;
+// RFC 8555 §8.3 asks for at least 128 bits of entropy and base64url, not more.
+const maxTokenLength = 128
 
 // NewChallengeServer creates a challenge server. backend/prefix enable cluster-wide
 // challenge serving; backend may be nil to disable storage mirroring.
@@ -51,7 +71,28 @@ func NewChallengeServer(backend storage.Backend, prefix string, logger *slog.Log
 		prefix:  prefix,
 		alpn:    make(map[string]*tls.Certificate),
 		http:    make(map[string]string),
+		misses:  make(map[string]time.Time),
 	}
+}
+
+// validToken reports whether s has the shape of an ACME challenge token:
+// base64url (RFC 8555 §8.3), non-empty, bounded. The token comes straight from
+// the request path and becomes a storage key, so this is what keeps
+// "../../keys/<domain>" from being read out of the filesystem backend and
+// served over HTTP — which it was.
+func validToken(s string) bool {
+	if s == "" || len(s) > maxTokenLength {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		switch {
+		case 'A' <= c && c <= 'Z', 'a' <= c && c <= 'z', '0' <= c && c <= '9', c == '-', c == '_':
+		default:
+			return false
+		}
+	}
+	return true
 }
 
 func (c *ChallengeServer) alpnKey(domain string) string {
@@ -66,26 +107,31 @@ func (c *ChallengeServer) httpKey(token string) string {
 const challengeIO = 5 * time.Second
 
 // PutALPN registers a TLS-ALPN-01 token certificate for a domain, mirroring it to
-// storage so any node can answer the CA.
-func (c *ChallengeServer) PutALPN(domain string, cert *tls.Certificate) {
+// storage so any node can answer the CA. With a backend configured the mirror
+// write is the point, and its failure is the caller's: a token only this node
+// can serve is a validation the CA may well fail, and count.
+func (c *ChallengeServer) PutALPN(domain string, cert *tls.Certificate) error {
 	domain = strings.ToLower(domain)
 	c.alpnMu.Lock()
 	c.alpn[domain] = cert
 	c.alpnMu.Unlock()
 
 	if c.backend == nil {
-		return
+		return nil
 	}
 	pemBytes, err := encodeChallengeCert(cert)
 	if err != nil {
-		c.logger.Warn("acme: failed to encode tls-alpn-01 token for storage", "domain", domain, "error", err)
-		return
+		return fmt.Errorf("encode tls-alpn-01 token for %s: %w", domain, err)
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), challengeIO)
 	defer cancel()
 	if err := c.backend.PutObject(ctx, c.alpnKey(domain), strings.NewReader(string(pemBytes)), int64(len(pemBytes)), storage.PutOptions{ContentType: "application/x-pem-file"}); err != nil {
-		c.logger.Warn("acme: failed to mirror tls-alpn-01 token to storage", "domain", domain, "error", err)
+		c.alpnMu.Lock()
+		delete(c.alpn, domain)
+		c.alpnMu.Unlock()
+		return fmt.Errorf("mirror tls-alpn-01 token for %s to storage: %w", domain, err)
 	}
+	return nil
 }
 
 // DeleteALPN clears a TLS-ALPN-01 token certificate locally and in storage.
@@ -123,19 +169,27 @@ func (c *ChallengeServer) GetALPN(domain string) (*tls.Certificate, bool) {
 }
 
 // PutHTTP registers an HTTP-01 token/keyAuth pair, mirroring it to storage.
-func (c *ChallengeServer) PutHTTP(token, keyAuth string) {
+// A failed mirror write is an error for the same reason as PutALPN's.
+func (c *ChallengeServer) PutHTTP(token, keyAuth string) error {
 	c.httpMu.Lock()
 	c.http[token] = keyAuth
 	c.httpMu.Unlock()
+	c.missMu.Lock()
+	delete(c.misses, token)
+	c.missMu.Unlock()
 
 	if c.backend == nil {
-		return
+		return nil
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), challengeIO)
 	defer cancel()
 	if err := c.backend.PutObject(ctx, c.httpKey(token), strings.NewReader(keyAuth), int64(len(keyAuth)), storage.PutOptions{ContentType: "text/plain"}); err != nil {
-		c.logger.Warn("acme: failed to mirror http-01 token to storage", "error", err)
+		c.httpMu.Lock()
+		delete(c.http, token)
+		c.httpMu.Unlock()
+		return fmt.Errorf("mirror http-01 token to storage: %w", err)
 	}
+	return nil
 }
 
 // DeleteHTTP clears an HTTP-01 token locally and in storage.
@@ -156,14 +210,21 @@ func (c *ChallengeServer) HTTPHandler() http.Handler {
 			return
 		}
 		token := strings.TrimPrefix(r.URL.Path, prefix)
+		if !validToken(token) {
+			c.logger.Debug("acme http-01: request is not for a token", "path", r.URL.Path, "remote", r.RemoteAddr)
+			http.NotFound(w, r)
+			return
+		}
 
 		c.httpMu.RLock()
 		keyAuth, ok := c.http[token]
 		c.httpMu.RUnlock()
 
-		if !ok && c.backend != nil {
+		if !ok && c.backend != nil && !c.recentTokenMiss(token) {
 			if data, err := c.readFromStorage(c.httpKey(token)); err == nil {
 				keyAuth, ok = string(data), true
+			} else {
+				c.noteTokenMiss(token)
 			}
 		}
 		if !ok {
@@ -174,6 +235,24 @@ func (c *ChallengeServer) HTTPHandler() http.Handler {
 		w.Header().Set("Content-Type", "text/plain")
 		_, _ = w.Write([]byte(keyAuth))
 	})
+}
+
+// recentTokenMiss reports whether storage was asked about token within
+// tokenMissTTL and did not have it.
+func (c *ChallengeServer) recentTokenMiss(token string) bool {
+	c.missMu.Lock()
+	defer c.missMu.Unlock()
+	at, ok := c.misses[token]
+	return ok && time.Since(at) < tokenMissTTL
+}
+
+func (c *ChallengeServer) noteTokenMiss(token string) {
+	c.missMu.Lock()
+	defer c.missMu.Unlock()
+	if len(c.misses) >= tokenMissCap {
+		c.misses = make(map[string]time.Time)
+	}
+	c.misses[token] = time.Now()
 }
 
 func (c *ChallengeServer) readFromStorage(key string) ([]byte, error) {

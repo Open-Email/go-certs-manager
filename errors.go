@@ -33,6 +33,15 @@ var (
 	// "the CA handed us something unusable", which decide different things.
 	errPersistFailed = errors.New("tls: storing the certificate chain failed")
 
+	// ErrStorageUnavailable marks a decision that could not be taken because
+	// storage did not answer. It is never "nothing is there": a read that
+	// failed proves nothing about what storage holds, and the one thing it
+	// must not lead to is an order.
+	ErrStorageUnavailable = errors.New("tls: storage could not be read")
+
+	// errNoJournal marks an Issuer built without an order journal (tests).
+	errNoJournal = errors.New("tls: no order journal")
+
 	// ErrKeyCertMismatch is returned when a private key does not match the leaf
 	// certificate's public key — e.g. a follower refreshing a new chain before the
 	// corresponding key promotion has landed in storage.

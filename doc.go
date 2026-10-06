@@ -14,7 +14,13 @@
 //   - a caller-supplied leader predicate (e.g. memberlist-based) soft-gates
 //     issuance so only one node normally talks to the CA;
 //   - a per-domain issuance lease, taken by atomic create-once (IfNoneMatch:"*")
-//     in the storage backend, hard-guards against split-brain double-issuance;
+//     in the storage backend and taken over, once expired, by one conditional
+//     write against its ETag, hard-guards against split-brain double-issuance;
+//   - every decision to order treats a failed storage read as "cannot tell",
+//     never as "nothing there": only a definite not-found leads to an order;
+//   - the order in flight is journaled before it is placed, so an attempt
+//     interrupted after the CA issued collects the certificate next time
+//     instead of ordering again;
 //   - challenge tokens are mirrored to storage so whichever node the CA
 //     validates against can answer, even though another node drove the order;
 //   - followers never contact the CA: they serve certificates the leader

@@ -67,6 +67,16 @@ func NewFilesystemBackend(basePath string, logger *slog.Logger) (*FilesystemBack
 // Returns the path and true if valid, or empty string and false if the key
 // would escape the base directory (directory traversal).
 func (f *FilesystemBackend) getFullPath(key string) (string, bool) {
+	// A key is a storage name, never a path. A ".." segment has no meaning in
+	// one, so it is refused outright: cleaning "challenges/http/../../keys/x"
+	// yields "keys/x", which is under the base directory and is somebody's
+	// private key.
+	for _, seg := range strings.Split(key, "/") {
+		if seg == ".." {
+			f.logger.Warn("Path traversal attempt blocked", "key", key)
+			return "", false
+		}
+	}
 	// Sanitize key to prevent directory traversal attacks
 	key = filepath.Clean(key)
 	key = strings.TrimPrefix(key, "/")
