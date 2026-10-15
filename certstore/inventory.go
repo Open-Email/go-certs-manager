@@ -32,7 +32,8 @@ import (
 type Role string
 
 const (
-	// RoleConfigured is a name in the service's configured domains.
+	// RoleConfigured is a name in the service's configured domains, or one's
+	// RSA companion.
 	RoleConfigured Role = "configured"
 	// RoleOnDemand is a name in the on-demand allow-set the leader publishes.
 	RoleOnDemand Role = "on-demand"
@@ -197,7 +198,9 @@ func (inv *Inventory) Delete(ctx context.Context, domain string, force bool) (Ce
 
 func (inv *Inventory) describe(ctx context.Context, c *Certificate, keys, onDemand map[string]bool) {
 	switch {
-	case inv.configured[c.Domain]:
+	// A configured domain's RSA companion is served next to it, so it is as
+	// configured as the domain is. On-demand names have no companion.
+	case inv.configured[layout.CertDomain(c.Domain)]:
 		c.Role = RoleConfigured
 	case onDemand[c.Domain]:
 		c.Role = RoleOnDemand

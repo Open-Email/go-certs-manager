@@ -11,9 +11,11 @@ import (
 	"log/slog"
 	"math/big"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
+	"github.com/Open-Email/go-certs-manager/internal/layout"
 	"github.com/Open-Email/go-certs-manager/storage"
 )
 
@@ -24,17 +26,31 @@ type countingCA struct {
 	orders int
 	err    error
 	chain  []byte // when set, answered instead of a freshly built chain
+
+	namesMu sync.Mutex
+	names   []string // the name each order was placed under, in order
 }
 
-func (ca *countingCA) Issue(_ context.Context, domain string, certKey crypto.Signer) ([]byte, error) {
+// Issue answers as Issuer does: the order is placed under name, and the chain
+// is for the hostname that name certifies.
+func (ca *countingCA) Issue(_ context.Context, name string, certKey crypto.Signer) ([]byte, error) {
 	ca.orders++
+	ca.namesMu.Lock()
+	ca.names = append(ca.names, name)
+	ca.namesMu.Unlock()
 	if ca.err != nil {
 		return nil, ca.err
 	}
 	if ca.chain != nil {
 		return ca.chain, nil
 	}
-	return chainWithSerial(certKey, domain, int64(100+ca.orders))
+	return chainWithSerial(certKey, layout.CertDomain(name), int64(100+ca.orders))
+}
+
+func (ca *countingCA) orderedNames() []string {
+	ca.namesMu.Lock()
+	defer ca.namesMu.Unlock()
+	return append([]string(nil), ca.names...)
 }
 
 func chainWithSerial(key crypto.Signer, cn string, serial int64) ([]byte, error) {

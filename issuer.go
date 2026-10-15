@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/Open-Email/go-certs-manager/dane"
+	"github.com/Open-Email/go-certs-manager/internal/layout"
 
 	"golang.org/x/crypto/acme"
 )
@@ -25,11 +26,13 @@ const (
 	letsEncryptStagingURL = "https://acme-staging-v02.api.letsencrypt.org/directory"
 )
 
-// orderer is the one call the Manager makes on the CA: a chain for domain, bound
-// to certKey. *Issuer is the only production implementation; the seam exists so
-// a test can count orders and hand back a chain without a CA behind it.
+// orderer is the one call the Manager makes on the CA: a chain for the
+// certificate filed under name, bound to certKey. The name is a domain or a
+// domain's companion (layout.Companion); the chain is for the domain either way.
+// *Issuer is the only production implementation; the seam exists so a test can
+// count orders and hand back a chain without a CA behind it.
 type orderer interface {
-	Issue(ctx context.Context, domain string, certKey crypto.Signer) ([]byte, error)
+	Issue(ctx context.Context, name string, certKey crypto.Signer) ([]byte, error)
 }
 
 // Issuer drives RFC 8555 certificate issuance directly via x/crypto/acme,
@@ -104,8 +107,14 @@ func (i *Issuer) ensureRegistered(ctx context.Context) error {
 // died between finalize and download — a deploy restart, a deadline, a reset
 // connection — used to lose a certificate already charged to the weekly limit,
 // and the next attempt spent another.
-func (i *Issuer) Issue(ctx context.Context, domain string, certKey crypto.Signer) ([]byte, error) {
-	domain = strings.ToLower(domain)
+//
+// name is what the certificate is filed under: the domain, or its companion's
+// name (layout.Companion). The CA is asked for the domain either way; the
+// journal is kept per name, so a companion's order neither collects nor
+// overwrites the one a primary attempt left outstanding.
+func (i *Issuer) Issue(ctx context.Context, name string, certKey crypto.Signer) ([]byte, error) {
+	name = strings.ToLower(name)
+	domain := layout.CertDomain(name)
 	if err := i.ensureRegistered(ctx); err != nil {
 		return nil, err
 	}
@@ -114,7 +123,7 @@ func (i *Issuer) Issue(ctx context.Context, domain string, certKey crypto.Signer
 		return nil, err
 	}
 
-	order, err := i.resumeOrder(ctx, domain, spki)
+	order, err := i.resumeOrder(ctx, name, spki)
 	if err != nil {
 		return nil, err
 	}
@@ -123,9 +132,9 @@ func (i *Issuer) Issue(ctx context.Context, domain string, certKey crypto.Signer
 		if err != nil {
 			return nil, fmt.Errorf("authorize order for %s: %w", domain, err)
 		}
-		if err := i.journal.record(ctx, domain, order.URI, spki); err != nil {
+		if err := i.journal.record(ctx, name, order.URI, spki); err != nil {
 			i.logger.Warn("TLS: could not journal the order — if this attempt is interrupted after issuance the certificate will not be collected",
-				"domain", domain, "error", err)
+				"domain", name, "error", err)
 		}
 	}
 
@@ -137,14 +146,14 @@ func (i *Issuer) Issue(ctx context.Context, domain string, certKey crypto.Signer
 	// The certificate is in hand: the record has done its job. A context the
 	// caller has already given up on must not keep the record alive.
 	clearCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), challengeIO)
-	i.journal.clear(clearCtx, domain)
+	i.journal.clear(clearCtx, name)
 	cancel()
 
 	var pemChain []byte
 	for _, der := range chainDER {
 		pemChain = append(pemChain, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})...)
 	}
-	i.logger.Info("TLS: certificate issued", "domain", domain, "chain_len", len(chainDER))
+	i.logger.Info("TLS: certificate issued", "domain", name, "chain_len", len(chainDER))
 	return pemChain, nil
 }
 
@@ -194,22 +203,22 @@ func (i *Issuer) fetch(ctx context.Context, domain string, order *acme.Order) ([
 	return chainDER, nil
 }
 
-// resumeOrder returns the order a previous attempt for this domain and key
+// resumeOrder returns the order a previous attempt for this name and key
 // left outstanding, or nil when there is none worth collecting. It fails —
 // rather than answer nil — when the journal cannot be read or the CA cannot
 // say what became of the order: in either case the one thing this attempt
 // must not do is place another.
-func (i *Issuer) resumeOrder(ctx context.Context, domain, spki string) (*acme.Order, error) {
-	rec, err := i.journal.load(ctx, domain)
+func (i *Issuer) resumeOrder(ctx context.Context, name, spki string) (*acme.Order, error) {
+	rec, err := i.journal.load(ctx, name)
 	switch {
 	case err == nil:
 	case errors.Is(err, errNoJournal), absentFromStorage(err):
 		return nil, nil
 	default:
-		return nil, fmt.Errorf("cannot tell whether an order is outstanding for %s: %w: %v", domain, ErrStorageUnavailable, err)
+		return nil, fmt.Errorf("cannot tell whether an order is outstanding for %s: %w: %v", name, ErrStorageUnavailable, err)
 	}
 	if rec.OrderURL == "" || time.Since(time.Unix(rec.CreatedAt, 0)) > orderMaxAge {
-		i.journal.clear(ctx, domain)
+		i.journal.clear(ctx, name)
 		return nil, nil
 	}
 	if rec.SPKI != spki {
@@ -222,17 +231,17 @@ func (i *Issuer) resumeOrder(ctx context.Context, domain, spki string) (*acme.Or
 	if err != nil {
 		var ae *acme.Error
 		if errors.As(err, &ae) && ae.StatusCode >= 400 && ae.StatusCode < 500 {
-			i.logger.Info("TLS: the CA no longer knows the outstanding order — ordering afresh", "domain", domain, "error", err)
-			i.journal.clear(ctx, domain)
+			i.logger.Info("TLS: the CA no longer knows the outstanding order — ordering afresh", "domain", name, "error", err)
+			i.journal.clear(ctx, name)
 			return nil, nil
 		}
-		return nil, fmt.Errorf("cannot check the outstanding order for %s: %w", domain, err)
+		return nil, fmt.Errorf("cannot check the outstanding order for %s: %w", name, err)
 	}
 	if order.Status == acme.StatusInvalid || (!order.Expires.IsZero() && time.Now().After(order.Expires)) {
-		i.journal.clear(ctx, domain)
+		i.journal.clear(ctx, name)
 		return nil, nil
 	}
-	i.logger.Info("TLS: collecting the order a previous attempt left outstanding", "domain", domain, "status", order.Status)
+	i.logger.Info("TLS: collecting the order a previous attempt left outstanding", "domain", name, "status", order.Status)
 	return order, nil
 }
 

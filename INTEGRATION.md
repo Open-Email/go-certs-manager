@@ -79,6 +79,7 @@ mgr, err := certmanager.NewManager(ctx, &certmanager.Config{
         RenewBeforeDays:     cfg.TLS.LetsEncrypt.RenewBeforeDays,     // default 30
         MaxRetriesPerHour:   cfg.TLS.LetsEncrypt.MaxRetriesPerHour,   // default 3
         KeyType:             cfg.TLS.LetsEncrypt.KeyType,             // "ecdsa-p256" | "rsa-2048"
+        RSACompanion:        cfg.TLS.LetsEncrypt.RSACompanion,        // optional; ECDSA primary only
         DANE: certmanager.DANEConfig{ // optional; SMTP port-25 servers only
             MXHosts:    cfg.TLS.LetsEncrypt.DANE.MXHosts,
             TTLSeconds: cfg.TLS.LetsEncrypt.DANE.TLSADNSTTLSeconds,
@@ -113,6 +114,10 @@ Semantics to know:
 - `prefix` is the storage key prefix shared with the rest of your deployment's
   objects (e.g. `cfg.Storage.S3Prefix`); pass `""` for none.
 - `KeyType` must stay constant once keys exist.
+- `RSACompanion` adds an RSA certificate per configured domain for clients
+  that cannot use ECDSA (README, "RSA companion"). Clients that offer only
+  RSA key exchange also need those suites in the listener's `CipherSuites`,
+  added to the secure defaults.
 - Names are filed under one spelling — lower case, no trailing dot, punycode —
   so `Domains`, `DefaultDomain`, `DANE.MXHosts`, the on-demand set and the
   admin commands may all be written as an operator would type them.
@@ -343,6 +348,7 @@ staging = false
 renew_before_days = 30
 max_retries_per_hour = 3
 key_type = "ecdsa-p256"
+rsa_companion = false       # also serve an RSA certificate to clients that cannot use ECDSA
 
 [tls.letsencrypt.dane]      # SMTP port-25 servers only
 mx_hosts = []

@@ -96,8 +96,14 @@ func (k *KeyStore) LoadOrCreateAccountKey(ctx context.Context) (crypto.Signer, e
 
 // LoadOrCreateCertKey returns the persistent certificate key for a domain,
 // creating it once if absent. The returned key MUST be reused on every renewal.
+// A companion's name (layout.Companion) gets an RSA-2048 key whatever the
+// store's key type: being RSA is all a companion is for.
 func (k *KeyStore) LoadOrCreateCertKey(ctx context.Context, domain string) (crypto.Signer, error) {
-	return k.loadOrCreate(ctx, k.certKeyName(domain), k.keyType)
+	keyType := k.keyType
+	if layout.IsCompanion(domain) {
+		keyType = KeyTypeRSA2048
+	}
+	return k.loadOrCreate(ctx, k.certKeyName(domain), keyType)
 }
 
 // LoadCertKey loads an existing certificate key, returning os.ErrNotExist if none

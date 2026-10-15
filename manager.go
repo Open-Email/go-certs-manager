@@ -9,11 +9,13 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"slices"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/Open-Email/go-certs-manager/dane"
+	"github.com/Open-Email/go-certs-manager/internal/layout"
 	"github.com/Open-Email/go-certs-manager/internal/safego"
 	"github.com/Open-Email/go-certs-manager/storage"
 
@@ -68,6 +70,29 @@ type LetsEncryptConfig struct {
 	MaxRetriesPerHour   int    // max failed issuance attempts per domain per hour (0 = default 3)
 	KeyType             string // "ecdsa-p256" (default) or "rsa-2048"
 	DANE                DANEConfig
+
+	// RSACompanion also keeps an RSA-2048 certificate for every name in
+	// Domains, next to the ECDSA one, and serves it only to a client that
+	// cannot use the ECDSA certificate but can use the RSA one. Such clients
+	// are old appliances (printers, scanners, UPS cards) whose TLS stack offers
+	// RSA key exchange or ECDHE_RSA and nothing signed with ECDSA; every other
+	// client is served the ECDSA certificate exactly as before.
+	//
+	// The companion is filed as "<domain>+rsa" (chain and key), has its own
+	// persistent key, and is ordered and renewed by the leader's maintenance
+	// loop, only while the ECDSA certificate is in hand and fresh. It shares
+	// the domain's issuance lease and retry budget, because the CA counts
+	// validations and duplicate certificates per hostname, not per key.
+	//
+	// Not for on-demand hostnames: it would halve the new-order budget for a
+	// client class that reaches the platform's own names. Not DANE-pinned
+	// either: DesiredTLSARecords names the ECDSA key only. A client that
+	// cannot use ECDSA was refused before; one that also validates DANE is
+	// still refused, at verification rather than at the handshake.
+	//
+	// Requires KeyType "ecdsa-p256": with an RSA primary there is nothing for
+	// a companion to add.
+	RSACompanion bool
 }
 
 // DANEConfig configures DANE TLSA record computation for inbound SMTP (port 25).
@@ -97,6 +122,7 @@ type Manager struct {
 	renewBefore   time.Duration
 	checkInterval time.Duration
 	isLeaderF     func() bool
+	rsaCompanion  bool // LetsEncryptConfig.RSACompanion
 
 	onDemand *onDemand // dynamic allow-set (nil when not configured)
 
@@ -145,6 +171,9 @@ func NewManager(ctx context.Context, cfg *Config, backend storage.Backend, prefi
 	keyType := le.KeyType
 	if keyType == "" {
 		keyType = KeyTypeECDSAP256
+	}
+	if le.RSACompanion && keyType != KeyTypeECDSAP256 {
+		return nil, fmt.Errorf("tls: an RSA companion certificate needs an %s primary, not %s", KeyTypeECDSAP256, keyType)
 	}
 
 	// Every name under its one spelling (normalizeDomain) before anything is
@@ -244,6 +273,7 @@ func NewManager(ctx context.Context, cfg *Config, backend storage.Backend, prefi
 		renewBefore:    renewBefore,
 		checkInterval:  checkInterval,
 		isLeaderF:      leaderFunc,
+		rsaCompanion:   le.RSACompanion,
 		stopCh:         make(chan struct{}),
 		doneCh:         make(chan struct{}),
 	}
@@ -267,6 +297,7 @@ func NewManager(ctx context.Context, cfg *Config, backend storage.Backend, prefi
 		"email", le.Email,
 		"default_domain", defaultDomain,
 		"key_type", keyType,
+		"rsa_companion", le.RSACompanion,
 		"dane_mx_hosts", le.DANE.MXHosts,
 		"max_retries_per_hour", maxRetries,
 		"node_id", nodeID)
@@ -377,6 +408,11 @@ func (m *Manager) buildTLSConfig() *tls.Config {
 			m.logger.Error("TLS: failed to get certificate", "server_name", serverName, "error", err)
 			return nil, fmt.Errorf("%w for %s: %v", ErrCertificateUnavailable, serverName, err)
 		}
+		if m.rsaCompanion && !onDemandHost {
+			if companion, ok := m.companionFor(hello, serverName, cert); ok {
+				return companion, nil
+			}
+		}
 		// A leaf-only chain makes strict clients (Outlook / Exchange Online) abort.
 		if len(cert.Certificate) <= 1 {
 			m.logger.Warn("TLS: certificate chain may be incomplete (no intermediates)", "domain", serverName)
@@ -384,6 +420,40 @@ func (m *Manager) buildTLSConfig() *tls.Config {
 		return cert, nil
 	}
 	return cfg
+}
+
+// errCertificateCurve is crypto/tls's reason for refusing an ECDSA certificate
+// whose curve a TLS 1.2 client left out of supported_groups. crypto/tls exports
+// no sentinel for it; TestCompanion_Handshakes pins the text.
+const errCertificateCurve = "client doesn't support certificate curve"
+
+// companionFor returns domain's RSA companion for a client that cannot use the
+// primary certificate but can use the companion. Memory only: the handshake
+// never reads storage for it, and a node that does not hold it yet serves the
+// primary, as it did before the companion existed.
+//
+// Go's own ClientHelloInfo.SupportsCertificate decides, against the listener's
+// real configuration (its cipher suites above all), on a copy of the hello
+// with the server name cleared: the name was resolved above, through the
+// default domain when there was none, and the check would otherwise refuse
+// both certificates for an IP-literal SNI.
+//
+// One refusal is not taken at its word. The probe rejects an ECDSA certificate
+// whose curve a TLS 1.2 client did not list, but the handshake does not check
+// it: it negotiates X25519 and signs with P-256. Such a client is served
+// today, and switching it to RSA would gain nothing at the handshake and fail
+// DANE, which pins the primary key only.
+func (m *Manager) companionFor(hello *tls.ClientHelloInfo, domain string, primary *tls.Certificate) (*tls.Certificate, bool) {
+	probe := *hello
+	probe.ServerName = ""
+	if err := probe.SupportsCertificate(primary); err == nil || err.Error() == errCertificateCurve {
+		return nil, false
+	}
+	companion, ok := m.certCache.Get(layout.Companion(domain))
+	if !ok || probe.SupportsCertificate(companion) != nil {
+		return nil, false
+	}
+	return companion, true
 }
 
 // allowsName reports whether a (lower-cased) server name is one this node may
@@ -698,11 +768,15 @@ func rateLimitedUntil(err error) (time.Time, bool) {
 
 // acquireIssueLease takes the cluster-wide issuance lease for domain, returning a
 // release func and whether it was acquired. Nil-safe for tests/single-node.
+//
+// The lease is the hostname's: a companion's name takes its domain's lease, so
+// its order and the primary's never run at once anywhere in the cluster. They
+// would share the TLS-ALPN-01 answer, which is filed by hostname.
 func (m *Manager) acquireIssueLease(ctx context.Context, domain string) (func(), bool) {
 	if m.leaser == nil {
 		return func() {}, true
 	}
-	return m.leaser.acquire(ctx, domain)
+	return m.leaser.acquire(ctx, layout.CertDomain(domain))
 }
 
 // preload loads any already-issued certs from storage into memory so the server
@@ -710,13 +784,26 @@ func (m *Manager) acquireIssueLease(ctx context.Context, domain string) (func(),
 func (m *Manager) preload(ctx context.Context) {
 	loadCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
 	defer cancel()
-	for _, d := range m.domains {
+	for _, d := range slices.Concat(m.domains, m.companionNames()) {
 		if _, err := m.certCache.Refresh(loadCtx, d); err != nil {
 			m.logger.Debug("TLS: no preexisting certificate to preload", "domain", d, "error", err)
 		} else {
 			m.logger.Info("TLS: preloaded certificate from storage", "domain", d)
 		}
 	}
+}
+
+// companionNames is the name of every configured domain's RSA companion, none
+// when RSACompanion is off.
+func (m *Manager) companionNames() []string {
+	if !m.rsaCompanion {
+		return nil
+	}
+	names := make([]string, 0, len(m.domains))
+	for _, d := range m.domains {
+		names = append(names, layout.Companion(d))
+	}
+	return names
 }
 
 // TLSConfig returns a clone of the TLS configuration for HTTP/SMTP servers.
