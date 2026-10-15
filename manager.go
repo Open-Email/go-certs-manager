@@ -3,6 +3,8 @@ package certmanager
 import (
 	"context"
 	"crypto"
+	"crypto/ecdsa"
+	"crypto/elliptic"
 	"crypto/tls"
 	"errors"
 	"fmt"
@@ -410,7 +412,7 @@ func (m *Manager) buildTLSConfig() *tls.Config {
 		}
 		if m.rsaCompanion && !onDemandHost {
 			if companion, ok := m.companionFor(hello, serverName, cert); ok {
-				return companion, nil
+				cert = companion
 			}
 		}
 		// A leaf-only chain makes strict clients (Outlook / Exchange Online) abort.
@@ -438,15 +440,12 @@ const errCertificateCurve = "client doesn't support certificate curve"
 // default domain when there was none, and the check would otherwise refuse
 // both certificates for an IP-literal SNI.
 //
-// One refusal is not taken at its word. The probe rejects an ECDSA certificate
-// whose curve a TLS 1.2 client did not list, but the handshake does not check
-// it: it negotiates X25519 and signs with P-256. Such a client is served
-// today, and switching it to RSA would gain nothing at the handshake and fail
-// DANE, which pins the primary key only.
+// The primary is judged by usableAtHandshake, not by the probe alone; see
+// there for the one refusal the probe gets wrong.
 func (m *Manager) companionFor(hello *tls.ClientHelloInfo, domain string, primary *tls.Certificate) (*tls.Certificate, bool) {
 	probe := *hello
 	probe.ServerName = ""
-	if err := probe.SupportsCertificate(primary); err == nil || err.Error() == errCertificateCurve {
+	if usableAtHandshake(probe, primary) {
 		return nil, false
 	}
 	companion, ok := m.certCache.Get(layout.Companion(domain))
@@ -454,6 +453,52 @@ func (m *Manager) companionFor(hello *tls.ClientHelloInfo, domain string, primar
 		return nil, false
 	}
 	return companion, true
+}
+
+// usableAtHandshake reports whether a handshake with the client behind probe
+// can use cert. It is SupportsCertificate less one refusal the handshake does
+// not make: a TLS 1.2 client that left an ECDSA certificate's curve out of
+// supported_groups. The handshake negotiates X25519 and signs with P-256
+// regardless, so such a client is served today, and switching it to RSA would
+// gain nothing and fail DANE, which pins the primary key only.
+//
+// The refusal cannot simply be ignored, though: the probe makes it BEFORE it
+// looks at cipher suites, so on its own it says nothing about whether the
+// client offered an ECDSA suite at all. Asking again with the certificate's
+// curve listed gets past that one check, and the answer is then the
+// handshake's own.
+func usableAtHandshake(probe tls.ClientHelloInfo, cert *tls.Certificate) bool {
+	err := probe.SupportsCertificate(cert)
+	if err == nil {
+		return true
+	}
+	curve, ok := certificateCurve(cert)
+	if err.Error() != errCertificateCurve || !ok {
+		return false
+	}
+	probe.SupportedCurves = append(slices.Clone(probe.SupportedCurves), curve)
+	return probe.SupportsCertificate(cert) == nil
+}
+
+// certificateCurve names the curve of an ECDSA certificate's key.
+func certificateCurve(cert *tls.Certificate) (tls.CurveID, bool) {
+	signer, ok := cert.PrivateKey.(crypto.Signer)
+	if !ok {
+		return 0, false
+	}
+	pub, ok := signer.Public().(*ecdsa.PublicKey)
+	if !ok {
+		return 0, false
+	}
+	switch pub.Curve {
+	case elliptic.P256():
+		return tls.CurveP256, true
+	case elliptic.P384():
+		return tls.CurveP384, true
+	case elliptic.P521():
+		return tls.CurveP521, true
+	}
+	return 0, false
 }
 
 // allowsName reports whether a (lower-cased) server name is one this node may

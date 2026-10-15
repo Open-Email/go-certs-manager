@@ -132,7 +132,9 @@ handshake with `no cipher suite supported by both client and server`.
   keeps forward secrecy.
 - **Storage.** Chain and key are filed as `<domain>+rsa` (`certs/`, `keys/`,
   `orders/`), and `certstore` lists the companion of a configured domain as
-  configured, so `tls delete` refuses it while it is in use.
+  configured, so `tls delete` refuses it while it is in use. The inventory is
+  not told whether the option is on: after turning it off, remove a leftover
+  companion with `tls delete --force <domain>+rsa`.
 - **Issuance.** The leader orders and renews it in the same pass as the
   primary, only while the primary is in hand and outside its renewal window.
   It takes the domain's issuance lease and spends the domain's retry budget:

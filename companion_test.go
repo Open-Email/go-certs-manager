@@ -7,6 +7,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"errors"
+	"log/slog"
 	"net"
 	"slices"
 	"strings"
@@ -432,6 +433,21 @@ func TestCompanion_Handshakes(t *testing.T) {
 		}
 	})
 
+	// Go's probe refuses the curve BEFORE it looks at cipher suites, so the
+	// curve refusal alone cannot mean "this client can use ECDSA": one that
+	// also offers no ECDSA suite cannot, and must still reach the companion.
+	t.Run("a client that omits P-256 and offers no ECDSA suite gets the companion", func(t *testing.T) {
+		client := tls12(tls.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256)
+		client.CurvePreferences = []tls.CurveID{tls.X25519}
+		leaf, _, err := handshake(t, listener(m), client)
+		if err != nil {
+			t.Fatalf("handshake failed: %v", err)
+		}
+		if keyAlgorithm(leaf) != "RSA" {
+			t.Fatalf("served %s, want RSA", keyAlgorithm(leaf))
+		}
+	})
+
 	t.Run("not served when RSACompanion is off", func(t *testing.T) {
 		off := companionServer(t)
 		off.rsaCompanion = false
@@ -457,5 +473,25 @@ func TestAnnounceStoredChains_LeavesCompanionsOut(t *testing.T) {
 
 	if _, known := leader.onDemand.indexNotAfter(companionName); known {
 		t.Fatal("a companion was written into the on-demand index")
+	}
+}
+
+// A leaf-only chain makes strict clients (Outlook, Exchange Online) abort, so
+// the warning has to cover the certificate actually served, companion included.
+// The test chains here have no intermediates.
+func TestCompanion_IncompleteChainWarningCoversTheCompanion(t *testing.T) {
+	m := companionServer(t)
+	h := &capturingHandler{}
+	m.logger = slog.New(h)
+
+	leaf, _, err := handshake(t, listener(m), tls12(tls.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if keyAlgorithm(leaf) != "RSA" {
+		t.Fatalf("setup: served %s, want the companion", keyAlgorithm(leaf))
+	}
+	if !h.warnedAbout("certificate chain may be incomplete") {
+		t.Fatal("a leaf-only companion was served without the incomplete-chain warning")
 	}
 }

@@ -33,7 +33,9 @@ type Role string
 
 const (
 	// RoleConfigured is a name in the service's configured domains, or one's
-	// RSA companion.
+	// RSA companion. The inventory is not told whether RSACompanion is on, so
+	// a companion left behind after it is turned off still reads as configured
+	// and in use until it expires; remove it with a forced delete.
 	RoleConfigured Role = "configured"
 	// RoleOnDemand is a name in the on-demand allow-set the leader publishes.
 	RoleOnDemand Role = "on-demand"
