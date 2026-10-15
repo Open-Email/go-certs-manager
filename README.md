@@ -105,9 +105,48 @@ has properties that are wrong for a clustered mail fleet:
 - serves from the in-memory cache. On a miss: the **leader** kicks async
   issuance and fails the handshake with `ErrCertificateUnavailable` (the MTA
   retries; maintenance fills the cache); a **follower** does a throttled,
-  deduplicated storage refresh (3s negative-cache on misses).
+  deduplicated storage refresh (3s negative-cache on misses);
+- with `RSACompanion` on, serves a configured domain's RSA companion instead,
+  to a client that cannot use the ECDSA certificate but can use the RSA one
+  (see below). From memory only.
 
 The handshake goroutine never talks to the CA and never blocks on ACME.
+
+### RSA companion (optional)
+
+`LetsEncrypt.RSACompanion` keeps a second, RSA-2048 certificate for every
+configured domain next to the ECDSA one, for clients whose TLS stack predates
+ECDSA: old printers, scanners and UPS cards that offer RSA key exchange
+(`TLS_RSA_WITH_*`) or ECDHE_RSA and nothing else. Without it they fail every
+handshake with `no cipher suite supported by both client and server`.
+
+- **Who gets it.** Go's `ClientHelloInfo.SupportsCertificate` decides, against
+  the listener's real configuration: a client that can use the ECDSA
+  certificate keeps it, whatever else it offers. One refusal is overridden: a
+  TLS 1.2 client that left P-256 out of `supported_groups` is still served
+  ECDSA, because the handshake does not check that and succeeds.
+- **RSA key exchange needs the listener's consent too.** Go's defaults have no
+  `TLS_RSA_WITH_*` suite since 1.22, so a client offering only those also
+  needs them in the listener's `tls.Config.CipherSuites` (on top of the
+  secure defaults, never instead of them). ECDHE_RSA is in the defaults and
+  keeps forward secrecy.
+- **Storage.** Chain and key are filed as `<domain>+rsa` (`certs/`, `keys/`,
+  `orders/`), and `certstore` lists the companion of a configured domain as
+  configured, so `tls delete` refuses it while it is in use. The inventory is
+  not told whether the option is on: after turning it off, remove a leftover
+  companion with `tls delete --force <domain>+rsa`.
+- **Issuance.** The leader orders and renews it in the same pass as the
+  primary, only while the primary is in hand and outside its renewal window.
+  It takes the domain's issuance lease and spends the domain's retry budget:
+  the CA counts failed validations and duplicate certificates per hostname,
+  and the TLS-ALPN-01 answer is filed by hostname. Followers re-read it every
+  tick, the leader writes it back if storage loses it, and
+  `RenewCertificate` does not touch it.
+- **Limits.** Configured domains only, never on-demand hostnames. Not
+  DANE-pinned: `DesiredTLSARecords` names the ECDSA key only, so a client that
+  cannot use ECDSA and validates DANE is still refused, now at verification
+  instead of at the handshake. Not reported through `OnServedExpiry`, whose
+  series are per hostname. Requires `KeyType` `ecdsa-p256`.
 
 ### Key management
 
@@ -118,6 +157,7 @@ The handshake goroutine never talks to the CA and never blocks on ACME.
 | `acme/account.key` | one cluster-wide ACME account key (always ECDSA P-256) |
 | `keys/<domain>` | persistent per-domain certificate key (`ecdsa-p256` default, or `rsa-2048`), **reused on every renewal** |
 | `keys/<domain>.next` | staged key during a key-replacement ceremony |
+| `keys/<domain>+rsa` | the RSA companion's persistent key (`RSACompanion`), always `rsa-2048` |
 
 Creation is serialized cluster-wide by conditional create-once: a node that
 loses the race reads the winner's key and **never regenerates** — every node

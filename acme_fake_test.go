@@ -40,6 +40,7 @@ type fakeCA struct {
 	orders     map[string]*fakeOrder
 	certs      map[string][]byte
 	seq        int
+	ordered    []string // every identifier a new-order request named
 }
 
 type fakeOrder struct {
@@ -124,6 +125,13 @@ func (f *fakeCA) serve(w http.ResponseWriter, r *http.Request) {
 	case path == "/new-order":
 		f.newOrders++
 		f.seq++
+		var req struct {
+			Identifiers []struct{ Value string }
+		}
+		_ = json.Unmarshal(jwsPayload(r), &req)
+		for _, id := range req.Identifiers {
+			f.ordered = append(f.ordered, id.Value)
+		}
 		id := fmt.Sprint(f.seq)
 		o := &fakeOrder{status: "ready"}
 		if f.challenges {

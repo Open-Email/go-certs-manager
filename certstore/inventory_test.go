@@ -243,6 +243,31 @@ func TestDelete_RefusesACertificateInUseUnlessForced(t *testing.T) {
 	}
 }
 
+// The RSA companion of a configured domain is served next to the primary, so
+// it is listed as configured and is as protected from a delete; one whose
+// domain is no longer configured is an orphan like any other.
+func TestList_CompanionOfAConfiguredDomainIsConfigured(t *testing.T) {
+	f := newFixture(t, "")
+	f.chain("mx.example.com"+layout.CompanionSuffix, fresh)
+	f.chain("gone.example"+layout.CompanionSuffix, fresh)
+	inv := New(f.backend, "", []string{"mx.example.com"}, 0)
+	list, err := inv.List(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := byDomain(list)
+	companion := got["mx.example.com"+layout.CompanionSuffix]
+	if companion.Role != RoleConfigured || !companion.InUse() || !companion.HasKey || companion.Algorithm != "RSA" {
+		t.Fatalf("companion listed as %+v, want a configured RSA certificate in use with its key", companion)
+	}
+	if role := got["gone.example"+layout.CompanionSuffix].Role; role != RoleOrphan {
+		t.Fatalf("companion of an unconfigured name listed as %q, want orphan", role)
+	}
+	if _, err := inv.Delete(context.Background(), "mx.example.com"+layout.CompanionSuffix, false); !errors.Is(err, ErrInUse) {
+		t.Fatalf("delete of a companion in use: err = %v, want ErrInUse", err)
+	}
+}
+
 // What nothing serves, and what no node could serve, go without --force.
 func TestDelete_RemovesOrphansAndUnservableChains(t *testing.T) {
 	f := newFixture(t, "")

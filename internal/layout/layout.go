@@ -19,6 +19,10 @@ const (
 	// NextKeySuffix marks a key staged by a key-replacement ceremony and not
 	// yet promoted.
 	NextKeySuffix = ".next"
+	// CompanionSuffix files a name's RSA companion certificate, chain and key
+	// alike, next to its primary one. A '+' cannot occur in a hostname, so no
+	// name is ever read as another's companion.
+	CompanionSuffix = "+rsa"
 	// OnDemandHosts is the on-demand allow-set the leader publishes.
 	OnDemandHosts = "ondemand/hosts.json"
 	// OnDemandCertIndex maps each on-demand hostname to the expiry of the
@@ -34,6 +38,16 @@ func Key(prefix, domain string) string { return prefix + KeyDir + strings.ToLowe
 
 // NextKey is the storage key of a name's staged replacement key.
 func NextKey(prefix, domain string) string { return Key(prefix, domain) + NextKeySuffix }
+
+// Companion is the name a domain's RSA companion certificate is filed under.
+func Companion(domain string) string { return strings.ToLower(domain) + CompanionSuffix }
+
+// IsCompanion reports whether name is a companion's.
+func IsCompanion(name string) bool { return strings.HasSuffix(name, CompanionSuffix) }
+
+// CertDomain is the hostname the certificate filed under name is for: the
+// domain a companion is filed next to, or the name itself.
+func CertDomain(name string) string { return strings.TrimSuffix(name, CompanionSuffix) }
 
 // OnDemandState is the object at OnDemandHosts.
 type OnDemandState struct {

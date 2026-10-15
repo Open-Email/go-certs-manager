@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -112,6 +113,9 @@ func (m *Manager) maintainOnce() {
 				m.logger.Debug("TLS: follower refresh found no certificate yet", "domain", domain, "error", err)
 			}
 		}()
+		if m.rsaCompanion {
+			m.maintainCompanion(leader, domain)
+		}
 	}
 
 	// Its own deadline, not the one the loop above just spent: with a domain
@@ -133,6 +137,34 @@ func (m *Manager) maintainOnce() {
 
 	m.maintainOnDemand(leader)
 	m.reportServed()
+}
+
+// maintainCompanion keeps domain's RSA companion current: the leader orders and
+// renews it, a follower re-reads it. It runs right after the primary's turn,
+// under its own deadline for the reason the primary has one.
+//
+// The leader orders it only while the primary is in hand and outside its
+// renewal window, so the companion never competes with the primary for the
+// hostname's retry budget, which it shares: a hostname the CA cannot validate
+// spends the budget on the certificate every client but the oldest needs.
+// When both are due in the same pass, the companion's order comes straight
+// after the primary's, while the CA still holds the validation it just made.
+func (m *Manager) maintainCompanion(leader bool, domain string) {
+	name := layout.Companion(domain)
+	ctx, cancel := m.tickContext(issueTimeout)
+	defer cancel()
+	if !leader {
+		if _, err := m.certCache.Refresh(ctx, name); err != nil {
+			m.logger.Debug("TLS: follower refresh found no companion certificate yet", "domain", name, "error", err)
+		}
+		return
+	}
+	if notAfter, ok := m.certCache.leafNotAfter(domain); !ok || time.Until(notAfter) <= m.renewBefore {
+		return
+	}
+	if err := m.renewIfNeeded(ctx, name); err != nil {
+		m.logger.Warn("TLS: maintenance issue/renew failed", "domain", name, "error", err)
+	}
 }
 
 // reportServed hands the configured callback the expiry of what this node
@@ -329,13 +361,14 @@ func (m *Manager) maintainOnDemand(leader bool) {
 // hostname either — memory already holds a fresh certificate for it, so neither
 // the classifier nor the handshake path will touch it again — so without this
 // the chain sits in storage that no follower is ever told to read, until it
-// expires. Static domains need none of it: followers re-read them every tick.
+// expires. Static domains need none of it, nor do their companions: followers
+// re-read them every tick.
 func (m *Manager) announceStoredChains(ctx context.Context, leader bool, stored []string) {
 	if !leader || m.onDemand == nil {
 		return
 	}
 	for _, domain := range stored {
-		if m.domainSet[domain] {
+		if m.domainSet[layout.CertDomain(domain)] {
 			continue
 		}
 		m.recordIssued(ctx, domain)
@@ -447,7 +480,7 @@ func (m *Manager) restoreMissingChains(ctx context.Context) []string {
 	}
 
 	var restored []string
-	for _, domain := range m.servedNames() {
+	for _, domain := range slices.Concat(m.servedNames(), m.companionNames()) {
 		if ctx.Err() != nil {
 			break
 		}

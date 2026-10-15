@@ -4,12 +4,19 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/Open-Email/go-certs-manager/internal/layout"
 )
 
 // retryBudgetWindow is the sliding window over which failed issuance attempts
 // are counted. It matches the period of Let's Encrypt's "failed validations per
 // hostname" limit, so the budget maps directly onto the CA's own accounting.
 const retryBudgetWindow = time.Hour
+
+// budgetKey is the hostname a name's attempts count against. A companion's
+// failures are its domain's: the CA counts failed validations and duplicate
+// certificates per hostname, whatever key the order was for.
+func budgetKey(name string) string { return strings.ToLower(layout.CertDomain(name)) }
 
 // retryBudget caps failed ACME issuance attempts per domain over a sliding
 // one-hour window. Let's Encrypt allows 5 failed validations per hostname per
@@ -45,7 +52,7 @@ func (b *retryBudget) block(domain string, until time.Time) {
 	}
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	b.blocked[strings.ToLower(domain)] = until
+	b.blocked[budgetKey(domain)] = until
 }
 
 // allow reports whether another issuance attempt may run for domain. When the
@@ -57,7 +64,7 @@ func (b *retryBudget) allow(domain string) (time.Duration, bool) {
 	if b == nil {
 		return 0, true
 	}
-	domain = strings.ToLower(domain)
+	domain = budgetKey(domain)
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	if until, ok := b.blocked[domain]; ok {
@@ -78,7 +85,7 @@ func (b *retryBudget) recordFailure(domain string) {
 	if b == nil {
 		return
 	}
-	domain = strings.ToLower(domain)
+	domain = budgetKey(domain)
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	b.failures[domain] = append(b.prune(domain), b.now())
@@ -91,8 +98,8 @@ func (b *retryBudget) reset(domain string) {
 	}
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	delete(b.failures, strings.ToLower(domain))
-	delete(b.blocked, strings.ToLower(domain))
+	delete(b.failures, budgetKey(domain))
+	delete(b.blocked, budgetKey(domain))
 }
 
 // prune drops failures older than the window and returns what remains, oldest
