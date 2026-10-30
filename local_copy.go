@@ -233,9 +233,18 @@ func (m *Manager) startFromLocalCopy(name string, readErr error) {
 // elsewhere is a retired key that DANE clients refuse.
 func (m *Manager) supersedeLocalCopies() {
 	for _, name := range m.certCache.servedFromLocal() {
+		// An operator may be renewing or activating a replacement key while
+		// storage recovers. Do not let a read begun before that order install
+		// the old pair after the new one. Skip a busy name rather than spend
+		// this tick waiting for the whole order; the next tick retries it.
+		unlock, free := m.inflight.tryLock(name)
+		if !free {
+			continue
+		}
 		ctx, cancel := m.tickContext(localRecheckTimeout)
 		_, err := m.certCache.Refresh(ctx, name)
 		cancel()
+		unlock()
 		if err == nil {
 			m.logger.Info("TLS: storage answers again, serving its certificate instead of the local copy", "domain", name)
 		}
