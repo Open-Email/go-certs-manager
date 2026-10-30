@@ -43,6 +43,14 @@ type certCache struct {
 
 	pendingMu sync.Mutex
 	pending   map[string]pendingPersist // domain -> chain the CA issued that storage has not taken
+
+	// local is this node's own copy of what it serves (nil when off), for
+	// the names localFor accepts. See localCopy.
+	local    *localCopy
+	localFor func(name string) bool
+
+	fromLocalMu sync.Mutex
+	fromLocal   map[string]bool // name -> served from the local copy, storage not yet read
 }
 
 // pendingPersist is a chain this node paid an order for and could not write.
@@ -71,13 +79,14 @@ func newCertCache(backend storage.Backend, basePrefix string, keyFor func(ctx co
 		logger = slog.Default()
 	}
 	return &certCache{
-		backend: backend,
-		prefix:  basePrefix,
-		keyFor:  keyFor,
-		logger:  logger,
-		mem:     make(map[string]*tls.Certificate),
-		neg:     make(map[string]time.Time),
-		pending: make(map[string]pendingPersist),
+		backend:   backend,
+		prefix:    basePrefix,
+		keyFor:    keyFor,
+		logger:    logger,
+		mem:       make(map[string]*tls.Certificate),
+		neg:       make(map[string]time.Time),
+		pending:   make(map[string]pendingPersist),
+		fromLocal: make(map[string]bool),
 	}
 }
 
@@ -114,6 +123,7 @@ func (c *certCache) Store(ctx context.Context, domain string, chainPEM []byte, k
 	}
 	c.set(domain, cert)
 	c.dropPending(domain)
+	c.confirmed(domain, cert)
 	return cert, nil
 }
 
@@ -278,7 +288,46 @@ func (c *certCache) Refresh(ctx context.Context, domain string) (*tls.Certificat
 		return nil, err
 	}
 	c.set(domain, cert)
+	c.confirmed(domain, cert)
 	return cert, nil
+}
+
+// confirmed records that storage holds cert for domain: the local copy takes
+// it, and domain is no longer served from the copy alone. A copy that cannot
+// be written costs a restart during an outage, never a handshake now, so it
+// is logged and nothing else.
+func (c *certCache) confirmed(domain string, cert *tls.Certificate) {
+	key := strings.ToLower(domain)
+	c.fromLocalMu.Lock()
+	delete(c.fromLocal, key)
+	c.fromLocalMu.Unlock()
+	if c.local == nil || c.localFor == nil || !c.localFor(key) {
+		return
+	}
+	if err := c.local.save(key, cert); err != nil {
+		c.logger.Warn("TLS: could not update the local copy of a certificate", "domain", domain, "dir", c.local.dir, "error", err)
+	}
+}
+
+// setFromLocal serves a certificate read from the local copy, and remembers
+// that storage has not confirmed it yet.
+func (c *certCache) setFromLocal(domain string, cert *tls.Certificate) {
+	c.set(domain, cert)
+	c.fromLocalMu.Lock()
+	c.fromLocal[strings.ToLower(domain)] = true
+	c.fromLocalMu.Unlock()
+}
+
+// servedFromLocal lists the names served from the local copy that storage has
+// not confirmed since.
+func (c *certCache) servedFromLocal() []string {
+	c.fromLocalMu.Lock()
+	defer c.fromLocalMu.Unlock()
+	out := make([]string, 0, len(c.fromLocal))
+	for name := range c.fromLocal {
+		out = append(out, name)
+	}
+	return out
 }
 
 // absentFromStorage reports whether a Refresh error is the definite answer
@@ -321,10 +370,14 @@ func (c *certCache) storedLeafSPKI(ctx context.Context, domain string) (string, 
 func (c *certCache) loadChain(ctx context.Context, domain string) ([]byte, error) {
 	rc, err := c.backend.GetObject(ctx, c.chainKey(domain))
 	if err != nil {
-		return nil, err
+		return nil, readFailure(err)
 	}
 	defer rc.Close()
-	return io.ReadAll(rc)
+	chainPEM, err := io.ReadAll(rc)
+	if err != nil {
+		return nil, readFailure(err)
+	}
+	return chainPEM, nil
 }
 
 func (c *certCache) set(domain string, cert *tls.Certificate) {

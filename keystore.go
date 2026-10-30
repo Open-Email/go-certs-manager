@@ -209,12 +209,12 @@ func (k *KeyStore) loadOrCreate(ctx context.Context, name, keyType string) (cryp
 func (k *KeyStore) load(ctx context.Context, name string) (crypto.Signer, error) {
 	rc, err := k.backend.GetObject(ctx, name)
 	if err != nil {
-		return nil, err // includes os.ErrNotExist for missing keys
+		return nil, readFailure(err) // os.ErrNotExist for a missing key, unmarked
 	}
 	defer rc.Close()
 	data, err := io.ReadAll(rc)
 	if err != nil {
-		return nil, fmt.Errorf("read key %q: %w", name, err)
+		return nil, fmt.Errorf("read key %q: %w", name, readFailure(err))
 	}
 	return parseKeyPEM(data)
 }

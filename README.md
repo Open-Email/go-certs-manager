@@ -266,6 +266,51 @@ ticket and an MTA's invisible retry is not available. So a handshake for an
 **allowed** hostname may wait, bounded, for the issuance already in flight.
 Static domains are unaffected, and 0 keeps the original behaviour.
 
+### Local copy (optional)
+
+`LetsEncrypt.LocalDir` keeps a copy of what this node serves on its own disk,
+so a process that **starts** while storage cannot be read still has a
+certificate. A running manager does not need it: it serves from memory
+through an outage. Without it, a restart during one comes up with nothing to
+serve until storage answers.
+
+- **What is kept.** One file per configured domain and per companion,
+  `<name>.pem`: the private key, then the chain leaf first, written by temp
+  file and rename, 0600 in a 0700 directory. On-demand hostnames are not
+  kept: their allow-set lives in storage too, so a restart without storage
+  could not serve them anyway.
+- **When it is written.** Only after storage confirmed the chain: a refresh
+  that read it, an issuance that stored it, a held chain that was finally
+  written. A chain the CA issued that storage has not taken is not copied.
+  The file is rewritten only when its contents change.
+- **When it is read.** Only at startup, and only for a name storage could
+  not be read for. A definite "none" from storage, or a chain bound to
+  another key (a key replacement in progress), is storage's answer and wins.
+  The file is served only if the key matches the leaf, the leaf covers the
+  name and has not expired; anything else is logged at warn and skipped.
+- **When it stops being used.** Every maintenance tick re-reads storage for a
+  name served from the copy until a read succeeds, on the leader as well: a
+  leader otherwise re-reads a name it holds only when it is due for renewal.
+  Nothing is ordered from the copy; ordering needs the issuance lease, which
+  is a storage write.
+- **DANE.** The file holds the pair the node was serving, so its SPKI is the
+  one published. A node that missed a key replacement and restarts during an
+  outage serves the retired key until storage answers, and a DANE-validating
+  client refuses it (RFC 7672 fails closed); the first successful read
+  replaces it.
+- **Deciding to start.** `MissingCertificates()` lists the configured domains
+  the node holds no certificate for. A host whose own storage check fails at
+  startup can carry on when it is empty and stop when it is not, so a fresh
+  node, or broken credentials with no copy, still fails fast.
+- **Exposure.** The file is the key the process can already read from
+  storage with its own credentials, on the same host under the same user. It
+  adds no reader.
+
+`NewManager` also bounds its own first contact with storage (the
+conditional-write probe at 10 s, the preload at 15 s), whatever context the
+caller passes, so a storage endpoint that accepts connections and never
+answers cannot hold startup.
+
 ## Failure modes and guarantees
 
 - **Split-brain**: two believed-leaders are serialized by the storage lease.
@@ -278,6 +323,9 @@ Static domains are unaffected, and 0 keeps the original behaviour.
   ignores `If-None-Match`; a single node carries on without the lease.
 - **Storage down**: leases fail safe (no issuance while uncertain); handshakes
   keep serving in-memory certs; followers keep last-good certs.
+- **Restart while storage is down**: nothing to serve, unless `LocalDir` is
+  set and holds a usable copy (see "Local copy"). The copy is replaced by
+  storage's chain on the first tick that can read it.
 - **Storage reads failing while writes work**: no order. "I could not read
   it" is never "there is nothing there" — only a definite not-found leads to
   an order. The alternative was a leader restarted during a read fault
