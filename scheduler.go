@@ -82,6 +82,10 @@ func (m *Manager) maintainOnce() {
 	// whether this node may publish to the shared index at all.
 	leader := m.isLeader()
 
+	// Before the restore below, which writes back what memory holds: a name
+	// served from the local copy takes storage's chain first, if it can be read.
+	m.supersedeLocalCopies()
+
 	if leader {
 		restoreCtx, cancelRestore := m.tickContext(flushTimeout)
 		stored = append(stored, m.restoreMissingChains(restoreCtx)...)
@@ -606,6 +610,9 @@ func (m *Manager) flushOne(ctx context.Context, domain string, p pendingPersist,
 	}
 	m.logger.Info(stored, "domain", domain)
 	m.certCache.dropPending(domain)
+	if cert, ok := m.certCache.Get(domain); ok {
+		m.certCache.confirmed(domain, cert)
+	}
 	return true
 }
 

@@ -95,6 +95,17 @@ type LetsEncryptConfig struct {
 	// Requires KeyType "ecdsa-p256": with an RSA primary there is nothing for
 	// a companion to add.
 	RSACompanion bool
+
+	// LocalDir, when set, keeps a copy of the certificate and key this node
+	// serves for each name in Domains (and each companion) in this directory
+	// on its own disk, so a process that starts while storage cannot be read
+	// still serves them. Storage stays the source of truth: the copy is
+	// written only after storage confirmed what it holds, read only when
+	// storage could not be read at startup, and replaced by storage's answer
+	// on the first maintenance tick that can read it. Nothing is ordered from
+	// it. Created 0700 if missing, one 0600 file per name; NewManager fails
+	// if it cannot be written. Empty = no local copy.
+	LocalDir string
 }
 
 // DANEConfig configures DANE TLSA record computation for inbound SMTP (port 25).
@@ -127,6 +138,8 @@ type Manager struct {
 	rsaCompanion  bool // LetsEncryptConfig.RSACompanion
 
 	onDemand *onDemand // dynamic allow-set (nil when not configured)
+
+	local *localCopy // LetsEncryptConfig.LocalDir (nil when off)
 
 	tlsConfig      *tls.Config
 	leaser         *issueLeaser // cluster-wide issuance lease (split-brain guard)
@@ -184,11 +197,24 @@ func NewManager(ctx context.Context, cfg *Config, backend storage.Backend, prefi
 	le.DefaultDomain = normalizeDomain(le.DefaultDomain)
 	le.DANE.MXHosts = normalizeDomains(le.DANE.MXHosts)
 
+	// Before anything reaches storage: a directory that cannot be used is a
+	// configuration error, and the copy is what the reads below fall back on.
+	var local *localCopy
+	if le.LocalDir != "" {
+		var err error
+		if local, err = newLocalCopy(le.LocalDir, logger); err != nil {
+			return nil, err
+		}
+	}
+
 	// The lease and the key create-once are conditional writes. A backend that
 	// ignores the condition cannot serve a cluster; a single node needs no
 	// lease and carries on without one.
 	leaseBackend := backend
-	switch supported, err := verifyConditionalWrites(ctx, backend, prefix); {
+	probeCtx, cancelProbe := context.WithTimeout(ctx, storageProbeTimeout)
+	supported, err := verifyConditionalWrites(probeCtx, backend, prefix)
+	cancelProbe()
+	switch {
 	case err != nil:
 		logger.Warn("TLS: could not verify that storage honours conditional writes — assuming it does", "error", err)
 	case !supported && leaderFunc != nil:
@@ -282,6 +308,9 @@ func NewManager(ctx context.Context, cfg *Config, backend storage.Backend, prefi
 	if cfg.OnDemand != nil {
 		m.onDemand = newOnDemand(*cfg.OnDemand, backend, prefix)
 	}
+	if local != nil {
+		m.useLocalCopy(local)
+	}
 	m.tlsConfig = m.buildTLSConfig()
 
 	// Preload any certs already in storage so we can serve immediately, then run
@@ -300,6 +329,7 @@ func NewManager(ctx context.Context, cfg *Config, backend storage.Backend, prefi
 		"default_domain", defaultDomain,
 		"key_type", keyType,
 		"rsa_companion", le.RSACompanion,
+		"local_dir", le.LocalDir,
 		"dane_mx_hosts", le.DANE.MXHosts,
 		"max_retries_per_hour", maxRetries,
 		"node_id", nodeID)
@@ -825,15 +855,21 @@ func (m *Manager) acquireIssueLease(ctx context.Context, domain string) (func(),
 }
 
 // preload loads any already-issued certs from storage into memory so the server
-// can serve before maintenance runs. Best-effort.
+// can serve before maintenance runs. Best-effort. A name storage could not be
+// read for is served from the local copy, when there is one; a name storage
+// answered for, "none" included, is not.
 func (m *Manager) preload(ctx context.Context) {
-	loadCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	loadCtx, cancel := context.WithTimeout(ctx, preloadTimeout)
 	defer cancel()
 	for _, d := range slices.Concat(m.domains, m.companionNames()) {
-		if _, err := m.certCache.Refresh(loadCtx, d); err != nil {
-			m.logger.Debug("TLS: no preexisting certificate to preload", "domain", d, "error", err)
-		} else {
+		_, err := m.certCache.Refresh(loadCtx, d)
+		switch {
+		case err == nil:
 			m.logger.Info("TLS: preloaded certificate from storage", "domain", d)
+		case m.local != nil && errors.Is(err, ErrStorageUnavailable):
+			m.startFromLocalCopy(d, err)
+		default:
+			m.logger.Debug("TLS: no preexisting certificate to preload", "domain", d, "error", err)
 		}
 	}
 }

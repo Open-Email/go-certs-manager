@@ -80,6 +80,7 @@ mgr, err := certmanager.NewManager(ctx, &certmanager.Config{
         MaxRetriesPerHour:   cfg.TLS.LetsEncrypt.MaxRetriesPerHour,   // default 3
         KeyType:             cfg.TLS.LetsEncrypt.KeyType,             // "ecdsa-p256" | "rsa-2048"
         RSACompanion:        cfg.TLS.LetsEncrypt.RSACompanion,        // optional; ECDSA primary only
+        LocalDir:            cfg.TLS.LetsEncrypt.LocalDir,            // optional; e.g. /var/lib/<svc>/tls
         DANE: certmanager.DANEConfig{ // optional; SMTP port-25 servers only
             MXHosts:    cfg.TLS.LetsEncrypt.DANE.MXHosts,
             TTLSeconds: cfg.TLS.LetsEncrypt.DANE.TLSADNSTTLSeconds,
@@ -118,6 +119,26 @@ Semantics to know:
   that cannot use ECDSA (README, "RSA companion"). Clients that offer only
   RSA key exchange also need those suites in the listener's `CipherSuites`,
   added to the secure defaults.
+- `LocalDir` keeps a copy of what the node serves on its own disk, for a
+  restart while storage cannot be read (README, "Local copy"). NewManager
+  creates it 0700 and fails if it cannot write there. To start without
+  storage, make the host's own startup storage check non-fatal only when
+  `LocalDir` is set, and stop if `mgr.MissingCertificates()` is not empty
+  right after `NewManager`:
+
+  ```go
+  exists, storageErr := backend.BucketExists(ctx) // the host's own check, as before
+  if storageErr == nil && !exists {
+      storageErr = errors.New("bucket does not exist")
+  }
+  // ... NewManager ...
+  if storageErr != nil {
+      if missing := mgr.MissingCertificates(); len(missing) > 0 {
+          return fmt.Errorf("storage unreachable and no local copy for %v: %w", missing, storageErr)
+      }
+      logger.Error("storage unreachable at startup, serving the local copy", "error", storageErr)
+  }
+  ```
 - Names are filed under one spelling — lower case, no trailing dot, punycode —
   so `Domains`, `DefaultDomain`, `DANE.MXHosts`, the on-demand set and the
   admin commands may all be written as an operator would type them.
@@ -349,6 +370,7 @@ renew_before_days = 30
 max_retries_per_hour = 3
 key_type = "ecdsa-p256"
 rsa_companion = false       # also serve an RSA certificate to clients that cannot use ECDSA
+local_dir = ""              # e.g. "/var/lib/<svc>/tls": serve a local copy when storage is down at startup
 
 [tls.letsencrypt.dane]      # SMTP port-25 servers only
 mx_hosts = []
